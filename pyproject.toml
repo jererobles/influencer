@@ -1,0 +1,30 @@
+[tool.poetry]
+name = "influencer"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+simpleobsws = "^1.4.0"
+av = "^11.0.0"
+imutils = "^0.5.4"
+python-vlc = "^3.0.20123"
+yolov4 = "^3.2.0"
+tensorflow = "^2.16.1"
+opencv-python = "^4.9.0.80"
+tf-keras = ">=2.16,<3.0"
+tqdm = "^4.66.2"
+pyyaml = "^6.0.1"
+pycoral = {version = "^2.0.0", source = "pycoral"}
+
+[[tool.poetry.source]]
+name = "pycoral"
+url = "https://google-coral.github.io/py-repo/"
+default = false
+secondary = false
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
