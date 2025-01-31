@@ -17,6 +17,8 @@ dependencies = [
     "tqdm>=4.66.2,<5",
     "pyyaml>=6.0.1,<7",
     "pycoral>=2.0.0,<3",
+    "aiohttp>=3.11.11",
+    "aiomqtt>=2.3.0",
 ]
 
 [tool.uv]
@@ -27,7 +29,3 @@ url = "https://google-coral.github.io/py-repo/"
 
 [tool.uv.sources]
 pycoral = { index = "pycoral" }
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
