@@ -12,7 +12,7 @@ from video.Stream import Stream
 from collections import deque
 
 ENABLE_PREVIEW = True
-CONTROL_OBS = False
+CONTROL_OBS = True
 CAPTURE_FPS = 5  # Capture at 5 FPS
 FRAME_INTERVAL = 1  # Process every 3rd frame
 GRID_CELL = 512
@@ -29,33 +29,33 @@ cameras = [
     #     "tag": "TP-Link Tapo C200",
     #     "zoom": 1
     # },
-    # {
-    #     "url": "rtsp://192.168.1.114:8080/h264_pcm.sdp",
-    #     "obs": "Samsung",
-    #     "tag": "Samsung",
-    #     "zoom": 1
-    # },
+    {
+        "url": "rtsp://192.168.33.17:8080/h264_pcm.sdp",
+        "obs": "Living",
+        "tag": "Samsung",
+        "zoom": 1
+    },
     # {
     #     "url": "rtsp://admin:234680@192.168.1.84:554/stream2",
     #     "obs": "Kitchen",
     #     "tag": "TP-Link",
     #     "zoom": 3.9
     # },
+    # {
+    #     "url": 0,
+    #     "obs": "Desk",
+    #     "tag": "ElGato Facecam",
+    #     "zoom": 1
+    # },
     {
         "url": 0,
-        "obs": "Desk",
-        "tag": "ElGato Facecam",
-        "zoom": 1
-    },
-    {
-        "url": 1,
-        "obs": "iPhone13",
+        "obs": "Office",
         "tag": "iPhone13 Continuity Camera",
         "zoom": 1
     },
     # {
     #     "url": "rtsp://192.168.1.112:8080/h264_pcm.sdp",
-    #     "obs": "Redmi",
+    #     "obs": "Living",
     #     "tag": "Redmi",
     #     "zoom": 1
     # },

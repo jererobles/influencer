@@ -1,1 +1,5 @@
 *.pyc
+old
+*.txt
+*.mp4
+.DS_Store

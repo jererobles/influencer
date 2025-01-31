@@ -1,7 +1,7 @@
 import simpleobsws
 
 # OBS WebSocket configuration
-obs_host = "192.168.1.45"
+obs_host = "192.168.33.14"
 obs_port = 4455
 obs_password = "Dxe7Vf68AhjmOa3h"
 
