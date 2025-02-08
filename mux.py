@@ -14,6 +14,7 @@ gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib
 from threading import Thread
 import sys
+import time
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 log = logging.getLogger(__name__)
@@ -32,12 +33,18 @@ class Camera:
     previous_frame: Optional[np.ndarray] = None  # for motion detection
     last_frame: Optional[np.ndarray] = None      # for display
     active: bool = False
+    last_active_time: float = 0  # timestamp when camera last became active
+    face_count: int = 0          # number of faces currently detected
+    motion_score: float = 0      # amount of motion (0-1)
+    main_camera: bool = False    # is this the main camera in PiP mode?
+    manual_main: bool = False    # was this camera manually selected as main
 
 class ViewMode(Enum):
     GRID = auto()      # show all cameras in grid
     ACTIVE = auto()    # show only active cameras
     OUTPUT = auto()    # show final composite output
     MOTION = auto()    # show motion detection debug view
+    PIP = auto()       # picture-in-picture mode
 
 class WorkshopStream:
     def __init__(self, debug: bool = False):
@@ -129,15 +136,28 @@ class WorkshopStream:
                             )
                             results = self.detector.detect(mp_image)
                             
-                            # Update activity state
-                            face_count = len(results.detections)
-                            if face_count > 0:
+                            # Update activity state and metrics
+                            camera.face_count = len(results.detections)
+                            if camera.face_count > 0:
+                                if not camera.active:  # Only log when state changes
+                                    log.info(f"Camera {camera.name} became active")
                                 camera.active = True
                                 camera.cooldown = 30
+                                camera.last_active_time = time.time()
                             elif camera.cooldown > 0:
                                 camera.cooldown -= 1
                             else:
+                                if camera.active:  # Only log when state changes
+                                    log.info(f"Camera {camera.name} became inactive")
                                 camera.active = False
+                                camera.face_count = 0
+                            
+                            # Calculate motion score
+                            if camera.previous_frame is not None:
+                                gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+                                diff = cv2.absdiff(camera.previous_frame, gray)
+                                camera.motion_score = np.mean(diff) / 255.0  # Normalize to 0-1
+                                camera.previous_frame = gray
                         
             except Exception as e:
                 log.error(f"Error in frame callback: {e}")
@@ -160,6 +180,40 @@ class WorkshopStream:
             pipeline.set_state(Gst.State.NULL)
             log.info(f"Pipeline stopped for {camera.name}")
         
+    def _select_main_camera(self) -> str:
+        """Select the best camera to show as main view"""
+        # First check for manually selected camera
+        manual_main = next((name for name, camera in self.cameras.items() 
+                           if camera.manual_main), None)
+        if manual_main:
+            return manual_main
+
+        best_camera = None
+        best_score = -1
+
+        for name, camera in self.cameras.items():
+            if not camera.active:
+                continue
+
+            # Calculate a score based on multiple factors
+            score = 0
+            score += camera.face_count * 2  # Faces are important
+            score += camera.motion_score    # Motion adds interest
+            
+            # Prefer recently activated cameras
+            time_since_active = time.time() - camera.last_active_time
+            score += max(0, 5 - time_since_active)  # Bonus for recent activity
+            
+            # If this was previously the main camera, give it a slight boost
+            if camera.main_camera:
+                score += 1
+
+            if score > best_score:
+                best_score = score
+                best_camera = name
+
+        return best_camera
+
     async def _create_debug_view(self) -> np.ndarray:
         """Create debug view based on current view mode"""
         if self.view_mode == ViewMode.OUTPUT and self.output_frame is not None:
@@ -167,7 +221,6 @@ class WorkshopStream:
             
         frames = []
         for name, camera in self.cameras.items():
-            # Use the last known good frame instead of waiting for a new one
             if camera.last_frame is None:
                 continue
             
@@ -183,20 +236,71 @@ class WorkshopStream:
                 gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
                 if camera.previous_frame is not None:
                     diff = cv2.absdiff(camera.previous_frame, gray)
-                    # colorize diff for visibility
                     diff_color = cv2.applyColorMap(diff, cv2.COLORMAP_HOT)
                     frame = cv2.resize(diff_color, camera.resolution)
                 camera.previous_frame = gray
             
-            # add camera name overlay
-            cv2.putText(frame, f"{name} {'[ACTIVE]' if camera.active else ''}", 
+            # add camera name overlay with pin icon if manually selected
+            status_text = f"{name}"
+            if camera.manual_main:
+                status_text += " [*]"  # ASCII pin symbol instead of emoji
+            if camera.active:
+                status_text += " [ACTIVE]"
+                
+            cv2.putText(frame, status_text, 
                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            frames.append(frame)
+            frames.append((name, frame))
             
         if not frames:
             return np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+        # Handle PiP mode
+        if self.view_mode == ViewMode.PIP:
+            output = np.zeros((1080, 1920, 3), dtype=np.uint8)
             
-        # create grid layout
+            # Select main camera
+            main_camera = self._select_main_camera()
+            if main_camera is None:
+                main_camera = frames[0][0]  # fallback to first camera
+            
+            # Update main_camera flags
+            for name, camera in self.cameras.items():
+                camera.main_camera = (name == main_camera)
+            
+            # Get main camera frame
+            main_frame = next(frame for name, frame in frames if name == main_camera)
+            main_frame = cv2.resize(main_frame, (1920, 1080))
+            output = main_frame
+            
+            # Add smaller overlays only for active cameras (excluding main camera)
+            pip_width = 480  # 1/4 of screen width
+            pip_height = 270  # Keep 16:9 aspect ratio
+            padding = 20  # Space between PiP windows
+            
+            active_frames = [(name, frame) for name, frame in frames 
+                           if name != main_camera and self.cameras[name].active]
+            
+            for i, (name, frame) in enumerate(active_frames):
+                # Calculate position for PiP
+                x = 1920 - pip_width - padding
+                y = padding + i * (pip_height + padding)  # Remove the -1 from i-1
+                
+                # Skip if we run out of vertical space
+                if y + pip_height > 1080:
+                    break
+                    
+                # Resize and overlay PiP
+                pip = cv2.resize(frame, (pip_width, pip_height))
+                
+                # Create a proper region for overlay
+                region = output[y:y+pip_height, x:x+pip_width]
+                overlay = cv2.addWeighted(pip, 0.8, region, 0.2, 0)
+                output[y:y+pip_height, x:x+pip_width] = overlay
+                
+            return output
+            
+        # Handle other view modes (grid layout)
+        frames = [frame for _, frame in frames]  # Extract just the frames
         n = len(frames)
         grid_size = int(np.ceil(np.sqrt(n)))
         cell_w = 1920 // grid_size
@@ -268,7 +372,7 @@ class WorkshopStream:
                         
                         key = cv2.waitKey(1) & 0xFF
                         if key == ord('q'):
-                            raise KeyboardInterrupt  # Trigger clean shutdown
+                            raise KeyboardInterrupt
                         elif key == ord('g'):
                             self.view_mode = ViewMode.GRID
                         elif key == ord('a'):
@@ -277,7 +381,38 @@ class WorkshopStream:
                             self.view_mode = ViewMode.OUTPUT
                         elif key == ord('m'):
                             self.view_mode = ViewMode.MOTION
-                        
+                        elif key == ord('p'):
+                            self.view_mode = ViewMode.PIP
+                        elif key == ord('\t') and self.view_mode == ViewMode.PIP:
+                            current_main = self._select_main_camera()
+                            log.info(f"TAB pressed. Current main: {current_main}")
+                            log.info(f"Camera states: {[(name, cam.active, cam.manual_main) for name, cam in self.cameras.items()]}")
+                            
+                            # Get list of active cameras
+                            active_cameras = [name for name, cam in self.cameras.items() if cam.active]
+                            
+                            if current_main and active_cameras:
+                                # Reset all camera flags
+                                for cam in self.cameras.values():
+                                    cam.main_camera = False
+                                    cam.manual_main = False
+                                    
+                                # Find next active camera
+                                if current_main in active_cameras:
+                                    current_idx = active_cameras.index(current_main)
+                                    next_idx = (current_idx + 1) % len(active_cameras)
+                                else:
+                                    next_idx = 0  # If current main is not active, start from first active camera
+                                    
+                                next_camera = self.cameras[active_cameras[next_idx]]
+                                next_camera.main_camera = True
+                                next_camera.manual_main = True
+                                log.info(f"Switched main camera to: {active_cameras[next_idx]}")
+                        elif key == ord('r') and self.view_mode == ViewMode.PIP:  # Add 'r' to release manual control
+                            # Reset all manual selections to return to automatic mode
+                            for cam in self.cameras.values():
+                                cam.manual_main = False
+
                         await asyncio.sleep(1/30)
                 finally:
                     cv2.destroyAllWindows()
@@ -302,7 +437,7 @@ class WorkshopStream:
 if __name__ == "__main__":
     # quick test with debug viewer
     stream = WorkshopStream(debug=True)
-    stream.add_camera("http://192.168.1.114:8080/video", "desk")
+    stream.add_camera("rtsp://192.168.1.114:8080/h264_pcm.sdp", "desk")
     stream.add_camera("rtsp://192.168.1.112:8080/h264_pcm.sdp", "wide")
     
     print("Debug controls:")
@@ -310,6 +445,9 @@ if __name__ == "__main__":
     print("  a - active cameras only")
     print("  o - composite output")
     print("  m - motion detection debug")
+    print("  p - picture-in-picture mode")
+    print("  TAB - cycle main camera (in PiP mode)")
+    print("  r - release manual control (in PiP mode)")
     print("  q - quit")
     
     try:
