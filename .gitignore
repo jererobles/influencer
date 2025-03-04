@@ -3,3 +3,4 @@ old
 *.txt
 *.mp4
 .DS_Store
+esp32/src/credentials.h

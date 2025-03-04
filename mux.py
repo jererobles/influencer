@@ -248,7 +248,7 @@ class WorkshopStream:
                 status_text += " [ACTIVE]"
                 
             cv2.putText(frame, status_text, 
-                      (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                      (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             frames.append((name, frame))
             
         if not frames:
