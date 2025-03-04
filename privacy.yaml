@@ -1,0 +1,55 @@
+esphome:
+  name: camera-privacy
+  platform: ESP32
+  board: esp32dev
+
+# Enable Home Assistant API
+api:
+
+ota:
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# Enable logging
+logger:
+
+# Hardware configuration
+output:
+  - platform: ledc
+    pin: GPIO12
+    id: status_led
+  - platform: ledc
+    id: servo_output
+    pin: GPIO13
+    frequency: 50 Hz
+
+servo:
+  - id: privacy_shutter
+    output: servo_output
+    restore: false
+
+binary_sensor:
+  - platform: gpio
+    pin: GPIO14
+    name: "Camera Motion"
+    device_class: motion
+
+light:
+  - platform: monochromatic
+    name: "Camera Status LED"
+    output: status_led
+
+switch:
+  - platform: template
+    name: "Camera Privacy Mode"
+    id: privacy_mode
+    optimistic: true
+    on_turn_on:
+      - servo.write:
+          id: privacy_shutter
+          level: 180
+    on_turn_off:
+      - servo.write:
+          id: privacy_shutter
+          level: 0 

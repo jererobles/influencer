@@ -2,5 +2,7 @@
 old
 *.txt
 *.mp4
+*.mkv
 .DS_Store
 esp32/src/credentials.h
+secrets.yaml

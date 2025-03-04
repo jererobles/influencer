@@ -258,7 +258,7 @@ class WorkshopStream:
             
         # Create a timestamp-based filename
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = f"recording_{timestamp}.mkv"
+        output_file = f"recordings/{timestamp}.mkv"
         
         # Create GStreamer pipeline for recording
         # Use a different approach with appsrc -> videoconvert -> encoder -> muxer -> filesink
