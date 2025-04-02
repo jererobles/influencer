@@ -108,14 +108,21 @@ class WorkshopStream:
         detection_counter = 0  # Add counter at start of method
         
         # Create GStreamer pipeline
-        if camera.url.startswith('http://'):
+        if camera.url.isdigit():  # USB webcam
+            pipeline_str = (
+                f'avfvideosrc device-index={camera.url} ! '
+                'video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1 ! '
+                'videoconvert ! video/x-raw,format=BGR ! '
+                'appsink name=sink emit-signals=True max-buffers=1 drop=True'
+            )
+        elif camera.url.startswith('http://'):  # HTTP stream
             pipeline_str = (
                 f'souphttpsrc location={camera.url} ! '
                 'decodebin ! videoconvert ! '
                 'video/x-raw,format=BGR ! '
                 'appsink name=sink emit-signals=True max-buffers=1 drop=True'
             )
-        else:  # RTSP
+        else:  # RTSP stream
             pipeline_str = (
                 f'rtspsrc location={camera.url} latency=0 ! '
                 'rtph264depay ! h264parse ! avdec_h264 ! '
@@ -1033,8 +1040,9 @@ class WorkshopStream:
 if __name__ == "__main__":
     # quick test with debug viewer
     stream = WorkshopStream(debug=True)
-    stream.add_camera("rtsp://192.168.1.114:8080/h264_pcm.sdp", "desk")
-    stream.add_camera("rtsp://192.168.1.112:8080/h264_pcm.sdp", "wide")
+    stream.add_camera("3", "desk")
+    # stream.add_camera("rtsp://192.168.68.123:8080/h264_pcm.sdp", "desk")
+    # stream.add_camera("rtsp://192.168.1.112:8080/h264_pcm.sdp", "wide")
     
     print("Debug controls:")
     print("  1 - grid view (all cameras)")
