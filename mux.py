@@ -17,10 +17,13 @@ import sys
 import time
 import datetime
 import yaml  # Add import for yaml to load secrets
+import gc  # Explicit garbage collection
+import weakref  # For weak references
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 log = logging.getLogger(__name__)
 
+# Initialize GStreamer once
 Gst.init(None)
 
 @dataclass
@@ -33,13 +36,37 @@ class Camera:
     motion_threshold: float = 0.1
     cooldown: int = 0
     previous_frame: Optional[np.ndarray] = None  # for motion detection
-    last_frame: Optional[np.ndarray] = None      # for display
-    active: bool = False
-    last_active_time: float = 0  # timestamp when camera last became active
     face_count: int = 0          # number of faces currently detected
     motion_score: float = 0      # amount of motion (0-1)
+    active: bool = False
+    last_active_time: float = 0  # timestamp when camera last became active
     main_camera: bool = False    # is this the main camera in PiP mode?
     manual_main: bool = False    # was this camera manually selected as main
+    
+    # Memory management
+    pipeline: Optional[Gst.Pipeline] = None
+    sink: Optional[Gst.Element] = None
+    
+    # Use a property for last_frame to control reference handling
+    _last_frame: Optional[np.ndarray] = None
+    
+    @property
+    def last_frame(self) -> Optional[np.ndarray]:
+        return self._last_frame
+    
+    @last_frame.setter
+    def last_frame(self, frame: Optional[np.ndarray]):
+        self._last_frame = frame
+    
+    def cleanup(self):
+        """Clean up resources when camera is no longer needed"""
+        self.previous_frame = None
+        self._last_frame = None
+        
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.sink = None
+            self.pipeline = None
 
 class ViewMode(Enum):
     GRID = auto()      # show all cameras in grid
@@ -48,12 +75,76 @@ class ViewMode(Enum):
     MOTION = auto()    # show motion detection debug view
     PIP = auto()       # picture-in-picture mode
 
+class FramePool:
+    """Memory pool for frame buffers to avoid constant allocations"""
+    
+    def __init__(self, max_frames=5):
+        self.available = []
+        self.max_frames = max_frames
+        self.size_map = {}  # Track frame sizes
+    
+    def get_frame(self, shape, dtype=np.uint8):
+        """Get a frame from the pool or create a new one if needed"""
+        key = (shape, dtype)
+        
+        if key in self.size_map:
+            frames = self.size_map[key]
+            if frames:
+                return frames.pop()
+        
+        # If we reach here, we need to create a new frame
+        return np.zeros(shape, dtype=dtype)
+    
+    def return_frame(self, frame):
+        """Return a frame to the pool"""
+        if frame is None:
+            return
+            
+        key = (frame.shape, frame.dtype)
+        
+        if key not in self.size_map:
+            self.size_map[key] = []
+            
+        frames = self.size_map[key]
+        
+        # Only keep a limited number of frames of each size
+        if len(frames) < self.max_frames:
+            frames.append(frame)
+
+class GstBuffer:
+    """Wrapper for GStreamer buffer management"""
+    
+    def __init__(self, size=0):
+        self.buffer = None
+        self.size = 0
+        if size > 0:
+            self.ensure_size(size)
+    
+    def ensure_size(self, size):
+        """Ensure the buffer is at least the requested size"""
+        if self.buffer is None or self.size < size:
+            self.buffer = bytearray(size)
+            self.size = size
+            return True
+        return False
+    
+    def get_view(self, size=None):
+        """Get a memory view of the buffer"""
+        if size is None or size == self.size:
+            return memoryview(self.buffer)
+        else:
+            return memoryview(self.buffer)[:size]
+    
+    def cleanup(self):
+        """Release the buffer"""
+        self.buffer = None
+        self.size = 0
+
 class WorkshopStream:
     def __init__(self, debug: bool = False):
         self.cameras: Dict[str, Camera] = {}
-        self.frame_buffer: Dict[str, asyncio.Queue] = {}
         self.output_frame: Optional[np.ndarray] = None
-        self.clean_frame_for_recording: Optional[np.ndarray] = None  # Clean frame without overlays for recording
+        self.clean_frame_for_recording: Optional[np.ndarray] = None
         self.running = False
         self.debug = debug
         self.view_mode = ViewMode.PIP
@@ -62,32 +153,42 @@ class WorkshopStream:
         self.recording = False
         self.recording_pipeline = None
         self.recording_src = None
-        self.recording_paused = False  # New flag to track if recording is paused
-        self.auto_recording = False    # Disable auto-recording by default
+        self.recording_paused = False
+        self.auto_recording = False
+        self.frame_count = 0  # Initialize frame counter
         
         # Streaming related attributes
         self.streaming = False
         self.streaming_pipeline = None
         self.streaming_src = None
+        
+        # Memory management
+        self.frame_pool = FramePool()
+        self.recording_buffer = GstBuffer()
+        self.streaming_buffer = GstBuffer()
+        
+        # Load secrets
         self.twitch_stream_key = self._load_twitch_stream_key()
         
-        # initialize mediapipe
+        # Initialize mediapipe detector
         BaseOptions = mp.tasks.BaseOptions
-        FaceDetector = mp.tasks.vision.FaceDetector
-        FaceDetectorOptions = mp.tasks.vision.FaceDetectorOptions
+        Detector = mp.tasks.vision.ObjectDetector
+        DetectorOptions = mp.tasks.vision.ObjectDetectorOptions
         VisionRunningMode = mp.tasks.vision.RunningMode
 
-        # Create a face detector instance with the image mode:
-        options = FaceDetectorOptions(
-            base_options=BaseOptions(model_asset_path='blaze_face_short_range.tflite'),
-            running_mode=VisionRunningMode.IMAGE)
-        self.detector = FaceDetector.create_from_options(options)
+        # Create detector for person detection
+        options = DetectorOptions(
+            base_options=BaseOptions(model_asset_path='efficientdet_lite0.tflite'),
+            running_mode=VisionRunningMode.IMAGE,
+            score_threshold=0.29,
+            category_allowlist=['person'])
+        self.detector = Detector.create_from_options(options)
         
     def add_camera(self, url: str, name: str) -> None:
         """Add a new camera to the stream"""
-        self.cameras[name] = Camera(url=url, name=name)
-        self.frame_buffer[name] = asyncio.Queue(maxsize=1)
-        log.info(f"added camera: {name} @ {url}")
+        camera = Camera(url=url, name=name)
+        self.cameras[name] = camera
+        log.info(f"Added camera: {name} @ {url}")
         
     def _load_twitch_stream_key(self) -> str:
         """Load Twitch stream key from secrets.yaml file"""
@@ -102,12 +203,9 @@ class WorkshopStream:
             log.error(f"Failed to load Twitch stream key: {e}")
             return ''
         
-    async def _capture_frames(self, camera: Camera) -> None:
-        """Capture frames from a camera and detect people"""
-        
-        detection_counter = 0  # Add counter at start of method
-        
-        # Create GStreamer pipeline
+    def _create_camera_pipeline(self, camera: Camera) -> None:
+        """Create and configure GStreamer pipeline for a camera"""
+        # Create GStreamer pipeline based on camera URL type
         if camera.url.isdigit():  # USB webcam
             pipeline_str = (
                 f'avfvideosrc device-index={camera.url} ! '
@@ -132,76 +230,131 @@ class WorkshopStream:
         
         log.info(f"Creating pipeline for {camera.name}: {pipeline_str}")
         
-        pipeline = Gst.parse_launch(pipeline_str)
-        sink = pipeline.get_by_name('sink')
+        # Create and store the pipeline in the camera object
+        camera.pipeline = Gst.parse_launch(pipeline_str)
+        camera.sink = camera.pipeline.get_by_name('sink')
+        
+    async def _capture_frames(self, camera: Camera) -> None:
+        """Capture frames from a camera and detect people"""
+        detection_counter = 0
+        
+        # Create GStreamer pipeline for this camera
+        self._create_camera_pipeline(camera)
+        
+        # Create a reference to self that won't prevent garbage collection
+        stream_ref = weakref.ref(self)
         
         # Setup frame callback
         def on_new_sample(appsink):
             try:
-                sample = appsink.emit('pull-sample')
-                if sample:
-                    buf = sample.get_buffer()
-                    caps = sample.get_caps()
-                    width = caps.get_structure(0).get_value('width')
-                    height = caps.get_structure(0).get_value('height')
+                # Get stream reference
+                stream = stream_ref()
+                if stream is None or not stream.running:
+                    return Gst.FlowReturn.OK
                     
-                    # Create numpy array from buffer data
-                    success, map_info = buf.map(Gst.MapFlags.READ)
-                    if success:
-                        # Create numpy array from the data
-                        frame = np.ndarray(
-                            shape=(height, width, 3),
-                            dtype=np.uint8,
-                            buffer=map_info.data
-                        ).copy()  # Make a copy to ensure we own the memory
-                        buf.unmap(map_info)
+                sample = appsink.emit('pull-sample')
+                if not sample:
+                    return Gst.FlowReturn.OK
+                    
+                buf = sample.get_buffer()
+                caps = sample.get_caps()
+                
+                structure = caps.get_structure(0)
+                width = structure.get_value('width')
+                height = structure.get_value('height')
+                
+                # Get buffer data
+                success, map_info = buf.map(Gst.MapFlags.READ)
+                if not success:
+                    return Gst.FlowReturn.OK
+                    
+                try:
+                    # Create a zero-copy view into the buffer
+                    array_view = np.ndarray(
+                        shape=(height, width, 3),
+                        dtype=np.uint8,
+                        buffer=map_info.data
+                    )
+                    
+                    # Get a reusable frame from the pool
+                    frame = stream.frame_pool.get_frame((height, width, 3))
+                    
+                    # Copy data only once - directly from the mapped buffer to our frame
+                    np.copyto(frame, array_view)
+                    
+                    # Store frame reference
+                    old_frame = camera.last_frame
+                    camera.last_frame = frame
+                    
+                    # Return old frame to the pool
+                    if old_frame is not None:
+                        stream.frame_pool.return_frame(old_frame)
                         
-                        # Store the frame
-                        camera.last_frame = frame
+                    # Handle detection on a subset of frames
+                    nonlocal detection_counter
+                    detection_counter += 1
+                    
+                    if detection_counter % 10 == 0:  # Every 10th frame
+                        # Get a frame for detection resizing
+                        small_frame = cv2.resize(frame, camera.detection_res)
                         
-                        nonlocal detection_counter  # Access outer counter
-                        detection_counter += 1  # Increment counter
+                        # Convert to RGB for MediaPipe
+                        small_frame_rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
                         
-                        # Run detection if needed
-                        if detection_counter % 10 == 0:  # Every 10th frame
-                            small_frame = cv2.resize(frame, camera.detection_res)
-                            small_frame_rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-                            mp_image = mp.Image(
-                                image_format=mp.ImageFormat.SRGB,
-                                data=small_frame_rgb
-                            )
-                            results = self.detector.detect(mp_image)
-                            
-                            # Update activity state and metrics
-                            camera.face_count = len(results.detections)
-                            if camera.face_count > 0:
-                                if not camera.active:  # Only log when state changes
-                                    log.info(f"Camera {camera.name} became active")
-                                camera.active = True
-                                camera.cooldown = 30
-                                camera.last_active_time = time.time()
-                            elif camera.cooldown > 0:
-                                camera.cooldown -= 1
-                            else:
-                                if camera.active:  # Only log when state changes
-                                    log.info(f"Camera {camera.name} became inactive")
-                                camera.active = False
-                                camera.face_count = 0
-                            
-                            # Calculate motion score
-                            if camera.previous_frame is not None:
-                                gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-                                diff = cv2.absdiff(camera.previous_frame, gray)
-                                camera.motion_score = np.mean(diff) / 255.0  # Normalize to 0-1
-                                camera.previous_frame = gray
+                        # Create MediaPipe image
+                        mp_image = mp.Image(
+                            image_format=mp.ImageFormat.SRGB,
+                            data=small_frame_rgb
+                        )
                         
+                        # Run detection
+                        results = stream.detector.detect(mp_image)
+                        
+                        # Update camera state
+                        camera.face_count = len(results.detections)
+                        if camera.face_count > 0:
+                            if not camera.active:
+                                log.info(f"Camera {camera.name} became active")
+                            camera.active = True
+                            camera.cooldown = 30
+                            camera.last_active_time = time.time()
+                        elif camera.cooldown > 0:
+                            camera.cooldown -= 1
+                        else:
+                            if camera.active:
+                                log.info(f"Camera {camera.name} became inactive")
+                            camera.active = False
+                            camera.face_count = 0
+                        
+                        # Calculate motion score
+                        # Convert to grayscale for motion detection
+                        gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+                        
+                        if camera.previous_frame is not None:
+                            # Calculate difference for motion detection
+                            diff = cv2.absdiff(camera.previous_frame, gray)
+                            camera.motion_score = np.mean(diff) / 255.0
+                        
+                        # Save current frame for next motion detection
+                        camera.previous_frame = gray
+                        
+                        # Clean up temporary objects
+                        del small_frame
+                        del small_frame_rgb
+                        del mp_image
+                        
+                finally:
+                    # Always unmap the buffer
+                    buf.unmap(map_info)
+                    
             except Exception as e:
                 log.error(f"Error in frame callback: {e}")
+                
             return Gst.FlowReturn.OK
         
         # Connect callback and start pipeline
-        sink.connect('new-sample', on_new_sample)
-        pipeline.set_state(Gst.State.PLAYING)
+        camera.sink.connect('new-sample', on_new_sample)
+        camera.pipeline.set_state(Gst.State.PLAYING)
         
         log.info(f"Pipeline started for {camera.name}")
         
@@ -213,9 +366,25 @@ class WorkshopStream:
             log.error(f"Error in pipeline loop: {e}")
         finally:
             # Cleanup
-            pipeline.set_state(Gst.State.NULL)
+            self._cleanup_camera(camera)
             log.info(f"Pipeline stopped for {camera.name}")
+    
+    def _cleanup_camera(self, camera: Camera) -> None:
+        """Clean up camera resources"""
+        if camera.pipeline:
+            camera.pipeline.set_state(Gst.State.NULL)
+        camera.pipeline = None
+        camera.sink = None
         
+        # Clear frame references
+        if camera.previous_frame is not None:
+            self.frame_pool.return_frame(camera.previous_frame)
+            camera.previous_frame = None
+            
+        if camera.last_frame is not None:
+            self.frame_pool.return_frame(camera.last_frame)
+            camera.last_frame = None
+            
     def _select_main_camera(self) -> str:
         """Select the best camera to show as main view"""
         # First check for manually selected camera
@@ -267,8 +436,10 @@ class WorkshopStream:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         output_file = f"recordings/{timestamp}.mkv"
         
+        # Ensure recordings directory exists
+        os.makedirs("recordings", exist_ok=True)
+        
         # Create GStreamer pipeline for recording
-        # Use a different approach with appsrc -> videoconvert -> encoder -> muxer -> filesink
         pipeline_str = (
             'appsrc name=src is-live=true format=time do-timestamp=true ! '
             'video/x-raw,format=BGR,width=1920,height=1080,framerate=30/1 ! '
@@ -301,9 +472,7 @@ class WorkshopStream:
         except Exception as e:
             log.error(f"Failed to start recording: {e}")
             self.recording = False
-            if self.recording_pipeline:
-                self.recording_pipeline.set_state(Gst.State.NULL)
-                self.recording_pipeline = None
+            self._cleanup_recording_pipeline()
 
     def pause_recording(self) -> None:
         """Pause the current recording without stopping the pipeline"""
@@ -312,6 +481,7 @@ class WorkshopStream:
             
         log.info("Pausing recording")
         self.recording_paused = True
+        self.pause_start_time = time.time()
         
         # Actually pause the pipeline
         if self.recording_pipeline:
@@ -336,28 +506,42 @@ class WorkshopStream:
 
     def stop_recording(self) -> None:
         """Stop recording"""
-        if self.recording:
-            log.info("Stopping recording")
+        if not self.recording:
+            return
             
-            # Calculate recording duration
-            duration = time.time() - self.start_time
-            if self.recording_paused:
-                # Subtract the time spent in pause
-                pause_duration = time.time() - self.pause_start_time
-                duration -= pause_duration
-            
-            log.info(f"Recording stopped. Duration: {duration:.2f} seconds, Frames: {self.frame_count}")
-            
-            # Stop the pipeline
-            if self.recording_pipeline:
-                self.recording_pipeline.send_event(Gst.Event.new_eos())
-                self.recording_pipeline.set_state(Gst.State.NULL)
-                self.recording_pipeline = None
-                self.recording_src = None
-            
-            self.recording = False
-            self.recording_paused = False
+        log.info("Stopping recording")
+        
+        # Calculate recording duration
+        duration = time.time() - self.start_time
+        if self.recording_paused:
+            # Subtract the time spent in pause
+            pause_duration = time.time() - self.pause_start_time
+            duration -= pause_duration
+        
+        log.info(f"Recording stopped. Duration: {duration:.2f} seconds, Frames: {self.frame_count}")
+        
+        # Properly clean up the pipeline
+        self._cleanup_recording_pipeline()
+        
+        self.recording = False
+        self.recording_paused = False
+        
+        # Run garbage collection after stopping recording
+        gc.collect()
     
+    def _cleanup_recording_pipeline(self) -> None:
+        """Clean up recording pipeline resources"""
+        if self.recording_pipeline:
+            # Send EOS and wait for it to propagate
+            self.recording_pipeline.send_event(Gst.Event.new_eos())
+            
+            # Set pipeline to NULL state
+            self.recording_pipeline.set_state(Gst.State.NULL)
+            
+            # Clear references
+            self.recording_pipeline = None
+            self.recording_src = None
+
     def start_streaming(self) -> None:
         """Start streaming to Twitch"""
         if self.streaming:
@@ -378,7 +562,7 @@ class WorkshopStream:
             f'rtmpsink location=rtmp://live.twitch.tv/app/{self.twitch_stream_key} sync=false'
         )
         
-        log.info(f"Creating streaming pipeline")
+        log.info("Creating streaming pipeline")
         
         try:
             self.streaming_pipeline = Gst.parse_launch(pipeline_str)
@@ -397,24 +581,35 @@ class WorkshopStream:
         except Exception as e:
             log.error(f"Failed to start streaming: {e}")
             self.streaming = False
-            if self.streaming_pipeline:
-                self.streaming_pipeline.set_state(Gst.State.NULL)
-                self.streaming_pipeline = None
-                self.streaming_src = None
+            self._cleanup_streaming_pipeline()
+    
+    def _cleanup_streaming_pipeline(self) -> None:
+        """Clean up streaming pipeline resources"""
+        if self.streaming_pipeline:
+            # Send EOS and wait for it to propagate
+            self.streaming_pipeline.send_event(Gst.Event.new_eos())
+            
+            # Set pipeline to NULL state
+            self.streaming_pipeline.set_state(Gst.State.NULL)
+            
+            # Clear references
+            self.streaming_pipeline = None
+            self.streaming_src = None
     
     def stop_streaming(self) -> None:
         """Stop streaming to Twitch"""
-        if self.streaming:
-            log.info("Stopping Twitch stream")
+        if not self.streaming:
+            return
             
-            # Stop the pipeline
-            if self.streaming_pipeline:
-                self.streaming_pipeline.send_event(Gst.Event.new_eos())
-                self.streaming_pipeline.set_state(Gst.State.NULL)
-                self.streaming_pipeline = None
-                self.streaming_src = None
-            
-            self.streaming = False
+        log.info("Stopping Twitch stream")
+        
+        # Properly clean up the pipeline
+        self._cleanup_streaming_pipeline()
+        
+        self.streaming = False
+        
+        # Run garbage collection after stopping streaming
+        gc.collect()
     
     def toggle_streaming(self) -> None:
         """Toggle streaming on/off"""
@@ -422,226 +617,316 @@ class WorkshopStream:
             self.stop_streaming()
         else:
             self.start_streaming()
-    
-    def push_frame_to_recording(self, frame: np.ndarray) -> None:
-        """Push a frame to the recording pipeline"""
-        if not self.recording or self.recording_paused:
-            return
             
-        if self.recording_src is None:
+    def push_frame_to_recording(self, frame: np.ndarray) -> None:
+        """Push a frame to the recording pipeline using zero-copy approach"""
+        if not self.recording or self.recording_paused or self.recording_src is None:
             return
             
         # Increment frame counter
         self.frame_count += 1
         
-        # Convert frame to GStreamer buffer
-        data = frame.tobytes()
-        buf = Gst.Buffer.new_allocate(None, len(data), None)
-        buf.fill(0, data)
+        # Get frame size
+        required_size = frame.nbytes
+        
+        # Ensure our buffer is large enough
+        self.recording_buffer.ensure_size(required_size)
+        
+        # Get numpy view of our reusable buffer
+        np_buffer = np.frombuffer(self.recording_buffer.buffer, dtype=np.uint8)
+        np_buffer = np_buffer[:required_size].reshape(frame.shape)
+        
+        # Copy frame data into our buffer
+        np.copyto(np_buffer, frame)
+        
+        # Create GStreamer buffer with our data
+        gst_buffer = Gst.Buffer.new_allocate(None, required_size, None)
+        gst_buffer.fill(0, self.recording_buffer.get_view(required_size))
         
         # Set buffer timestamp
         duration = 1 / 30 * Gst.SECOND  # Assuming 30 fps
         pts = (time.time() - self.start_time) * Gst.SECOND
-        buf.pts = pts
-        buf.duration = duration
+        gst_buffer.pts = pts
+        gst_buffer.duration = duration
         
         # Push buffer to pipeline
-        ret = self.recording_src.emit('push-buffer', buf)
+        ret = self.recording_src.emit('push-buffer', gst_buffer)
+        
+        # Explicitly release reference to help garbage collection
+        gst_buffer = None
+        
         if ret != Gst.FlowReturn.OK:
             log.warning(f"Error pushing buffer to recording: {ret}")
     
     def push_frame_to_streaming(self, frame: np.ndarray) -> None:
-        """Push a frame to the streaming pipeline"""
+        """Push a frame to the streaming pipeline using zero-copy approach"""
         if not self.streaming or self.streaming_src is None:
             return
-            
-        # Convert frame to GStreamer buffer
-        data = frame.tobytes()
-        buf = Gst.Buffer.new_allocate(None, len(data), None)
-        buf.fill(0, data)
+        
+        # Get frame size
+        required_size = frame.nbytes
+        
+        # Ensure our buffer is large enough
+        self.streaming_buffer.ensure_size(required_size)
+        
+        # Get numpy view of our reusable buffer
+        np_buffer = np.frombuffer(self.streaming_buffer.buffer, dtype=np.uint8)
+        np_buffer = np_buffer[:required_size].reshape(frame.shape)
+        
+        # Copy frame data into our buffer
+        np.copyto(np_buffer, frame)
+        
+        # Create GStreamer buffer with our data
+        gst_buffer = Gst.Buffer.new_allocate(None, required_size, None)
+        gst_buffer.fill(0, self.streaming_buffer.get_view(required_size))
         
         # Set buffer timestamp
         duration = 1 / 30 * Gst.SECOND  # Assuming 30 fps
         pts = time.time() * Gst.SECOND
-        buf.pts = pts
-        buf.duration = duration
+        gst_buffer.pts = pts
+        gst_buffer.duration = duration
         
         # Push buffer to pipeline
-        ret = self.streaming_src.emit('push-buffer', buf)
+        ret = self.streaming_src.emit('push-buffer', gst_buffer)
+        
+        # Explicitly release reference to help garbage collection
+        gst_buffer = None
+        
         if ret != Gst.FlowReturn.OK:
             log.warning(f"Error pushing buffer to streaming: {ret}")
     
     async def _create_debug_view(self) -> np.ndarray:
-        """Create debug view based on current view mode"""
-        # First create a clean frame without any text overlays
-        clean_frame = None
+        """Create debug view based on current view mode with memory optimizations"""
+        # For PIP mode
+        if self.view_mode == ViewMode.PIP:
+            return await self._create_pip_view()
         
+        # For OUTPUT mode
         if self.view_mode == ViewMode.OUTPUT and self.output_frame is not None:
-            clean_frame = self.output_frame.copy()
-            view = clean_frame.copy()  # Create a separate copy for display
+            # Get a frame from the pool for the output with UI elements
+            view = self.frame_pool.get_frame(self.output_frame.shape)
+            np.copyto(view, self.output_frame)
             
-            # Store the clean frame for recording
-            self.clean_frame_for_recording = clean_frame
+            # Store reference to output frame for recording (no copy needed)
+            self.clean_frame_for_recording = self.output_frame
             
             # Add UI elements to the display view only
             view = self._add_ui_elements(view)
             return view
-            
-        frames = []
-        clean_frames = []  # For storing frames without overlays
         
-        for name, camera in self.cameras.items():
-            if camera.last_frame is None:
-                continue
-            
-            frame = camera.last_frame.copy()
-            clean_frame_copy = frame.copy()  # Make a clean copy before adding overlays
-            
-            # skip inactive cameras in ACTIVE mode
-            if self.view_mode == ViewMode.ACTIVE and not camera.active:
-                continue
-            
-            # handle motion debug view
-            if self.view_mode == ViewMode.MOTION:
-                small = cv2.resize(frame, camera.motion_res)
-                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                if camera.previous_frame is not None:
-                    diff = cv2.absdiff(camera.previous_frame, gray)
-                    diff_color = cv2.applyColorMap(diff, cv2.COLORMAP_HOT)
-                    frame = cv2.resize(diff_color, camera.resolution)
-                    clean_frame_copy = frame.copy()  # Update clean copy for motion view
-                camera.previous_frame = gray
-            
-            # Add a small, subtle camera name overlay in the bottom-left corner
-            # Create a semi-transparent background for better readability
-            overlay = frame.copy()
-            
-            # Build the camera name text with status indicators
-            text = name
-            if camera.active:
-                text += " [active]"
-                
-            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 1)[0]
-            
-            # Draw a semi-transparent background rectangle
-            bg_x = 10
-            bg_y = frame.shape[0] - 10 - text_size[1] - 10  # 10px padding
-            bg_w = text_size[0] + 20  # 10px padding on each side
-            bg_h = text_size[1] + 10  # 5px padding on top and bottom
-            
-            cv2.rectangle(overlay, (bg_x, bg_y), (bg_x + bg_w, bg_y + bg_h), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)  # Apply transparency
-            
-            # Add camera name text with status indicators
-            cv2.putText(frame, text, 
-                      (bg_x + 10, bg_y + bg_h - 10), 
-                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
-            
-            frames.append((name, frame))
-            clean_frames.append((name, clean_frame_copy))
-            
-        if not frames:
-            blank = np.zeros((1080, 1920, 3), dtype=np.uint8)
-            self.clean_frame_for_recording = blank
-            blank = self._add_ui_elements(blank)
-            return blank
-
-        # Handle PiP mode
-        if self.view_mode == ViewMode.PIP:
-            output = np.zeros((1080, 1920, 3), dtype=np.uint8)
-            clean_output = np.zeros((1080, 1920, 3), dtype=np.uint8)  # Clean version for recording
-            
-            # Select main camera
-            main_camera = self._select_main_camera()
-            if main_camera is None:
-                main_camera = frames[0][0]  # fallback to first camera
-            
-            # Update main_camera flags
-            for name, camera in self.cameras.items():
-                camera.main_camera = (name == main_camera)
-            
-            # Get main camera frame (both display and clean versions)
-            main_frame = next(frame for name, frame in frames if name == main_camera)
-            main_frame = cv2.resize(main_frame, (1920, 1080))
-            output = main_frame
-            
-            # Get clean main camera frame
-            clean_main_frame = next(frame for name, frame in clean_frames if name == main_camera)
-            clean_main_frame = cv2.resize(clean_main_frame, (1920, 1080))
-            clean_output = clean_main_frame
-            
-            # Add smaller overlays only for active cameras (excluding main camera)
-            pip_width = 480  # 1/4 of screen width
-            pip_height = 270  # Keep 16:9 aspect ratio
-            padding = 20  # Space between PiP windows
-            
-            active_frames = [(name, frame) for name, frame in frames 
-                           if name != main_camera and self.cameras[name].active]
-            
-            active_clean_frames = [(name, frame) for name, frame in clean_frames 
-                                 if name != main_camera and self.cameras[name].active]
-            
-            for i, ((name, frame), (_, clean_frame)) in enumerate(zip(active_frames, active_clean_frames)):
-                # Calculate position for PiP
-                x = 1920 - pip_width - padding
-                y = padding + i * (pip_height + padding)
-                
-                # Skip if we run out of vertical space
-                if y + pip_height > 1080:
-                    break
-                    
-                # Resize and overlay PiP for display view
-                pip = cv2.resize(frame, (pip_width, pip_height))
-                region = output[y:y+pip_height, x:x+pip_width]
-                overlay = cv2.addWeighted(pip, 0.8, region, 0.2, 0)
-                output[y:y+pip_height, x:x+pip_width] = overlay
-                
-                # Resize and overlay PiP for clean recording view
-                clean_pip = cv2.resize(clean_frame, (pip_width, pip_height))
-                clean_region = clean_output[y:y+pip_height, x:x+pip_width]
-                clean_overlay = cv2.addWeighted(clean_pip, 0.8, clean_region, 0.2, 0)
-                clean_output[y:y+pip_height, x:x+pip_width] = clean_overlay
-            
-            # Store clean output for recording
+        # For other view modes (GRID, ACTIVE, MOTION)
+        return await self._create_grid_view()
+        
+    async def _create_pip_view(self) -> np.ndarray:
+        """Create picture-in-picture view with memory optimizations"""
+        # Prepare output frames - get from pool
+        output = self.frame_pool.get_frame((1080, 1920, 3))
+        clean_output = self.frame_pool.get_frame((1080, 1920, 3))
+        
+        # Initialize to black
+        output.fill(0)
+        clean_output.fill(0)
+        
+        # Select main camera
+        main_camera_name = self._select_main_camera()
+        
+        # If no main camera, return blank screen with UI
+        if main_camera_name is None:
             self.clean_frame_for_recording = clean_output
-            
-            # Add UI elements to the display view only
             output = self._add_ui_elements(output)
             return output
-            
-        # Handle other view modes (grid layout)
-        frames_display = [frame for _, frame in frames]  # Extract just the frames for display
-        frames_clean = [frame for _, frame in clean_frames]  # Extract clean frames for recording
         
-        n = len(frames_display)
-        grid_size = int(np.ceil(np.sqrt(n)))
-        cell_w = 1920 // grid_size
-        cell_h = 1080 // grid_size
+        # Update main_camera flags
+        for name, camera in self.cameras.items():
+            camera.main_camera = (name == main_camera_name)
         
-        output = np.zeros((1080, 1920, 3), dtype=np.uint8)
-        clean_output = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        # Get main camera frame
+        main_camera = self.cameras[main_camera_name]
+        main_frame = main_camera.last_frame
         
-        for i, (frame, clean_frame) in enumerate(zip(frames_display, frames_clean)):
-            y = (i // grid_size) * cell_h
-            x = (i % grid_size) * cell_w
+        if main_frame is None:
+            self.clean_frame_for_recording = clean_output
+            output = self._add_ui_elements(output)
+            return output
+        
+        # Resize main camera frame directly to output
+        cv2.resize(main_frame, (1920, 1080), dst=output)
+        cv2.resize(main_frame, (1920, 1080), dst=clean_output)
+        
+        # Add smaller overlays for active cameras (excluding main)
+        pip_width = 480  # 1/4 of screen width
+        pip_height = 270  # Keep 16:9 aspect ratio
+        padding = 20  # Space between PiP windows
+        
+        # Get active cameras excluding main
+        active_cameras = [(name, camera) for name, camera in self.cameras.items() 
+                         if name != main_camera_name and camera.active and camera.last_frame is not None]
+        
+        # Prepare PiP frame from pool once
+        pip_frame = self.frame_pool.get_frame((pip_height, pip_width, 3))
+        
+        for i, (name, camera) in enumerate(active_cameras):
+            # Calculate position for PiP
+            x = 1920 - pip_width - padding
+            y = padding + i * (pip_height + padding)
             
-            # Resize for display view
-            resized = cv2.resize(frame, (cell_w, cell_h))
-            output[y:y+cell_h, x:x+cell_w] = resized
+            # Skip if we run out of vertical space
+            if y + pip_height > 1080:
+                break
             
-            # Resize for clean recording view
-            clean_resized = cv2.resize(clean_frame, (cell_w, cell_h))
-            clean_output[y:y+cell_h, x:x+cell_w] = clean_resized
+            # Resize camera frame to PiP size
+            cv2.resize(camera.last_frame, (pip_width, pip_height), dst=pip_frame)
+            
+            # Insert PiP into output frames with overlay effect
+            region = output[y:y+pip_height, x:x+pip_width]
+            cv2.addWeighted(pip_frame, 0.8, region, 0.2, 0, dst=region)
+            
+            clean_region = clean_output[y:y+pip_height, x:x+pip_width]
+            cv2.addWeighted(pip_frame, 0.8, clean_region, 0.2, 0, dst=clean_region)
+        
+        # Return PiP frame to pool
+        self.frame_pool.return_frame(pip_frame)
         
         # Store clean output for recording
         self.clean_frame_for_recording = clean_output
         
-        # Add UI elements to the display view only
+        # Add UI elements to display view
         output = self._add_ui_elements(output)
         return output
         
+    async def _create_grid_view(self) -> np.ndarray:
+        """Create grid view with memory optimizations"""
+        # Collect frames based on view mode
+        frames = []
+        clean_frames = []
+        
+        for name, camera in self.cameras.items():
+            # Skip if no frame or inactive cameras in ACTIVE mode
+            if camera.last_frame is None:
+                continue
+                
+            if self.view_mode == ViewMode.ACTIVE and not camera.active:
+                continue
+            
+            # For motion debug view
+            if self.view_mode == ViewMode.MOTION and camera.previous_frame is not None:
+                # Create motion visualization
+                motion_frame = self.frame_pool.get_frame(camera.motion_res)
+                gray_frame = self.frame_pool.get_frame(camera.motion_res, dtype=np.uint8)
+                
+                # Resize and convert to grayscale
+                cv2.resize(camera.last_frame, camera.motion_res, dst=motion_frame)
+                cv2.cvtColor(motion_frame, cv2.COLOR_BGR2GRAY, dst=gray_frame)
+                
+                # Calculate difference
+                diff = cv2.absdiff(camera.previous_frame, gray_frame)
+                
+                # Create color mapped version
+                diff_color = cv2.applyColorMap(diff, cv2.COLORMAP_HOT)
+                
+                # Resize to full resolution
+                display_frame = self.frame_pool.get_frame(camera.resolution)
+                cv2.resize(diff_color, camera.resolution, dst=display_frame)
+                
+                # Add to frames list
+                frames.append((name, display_frame))
+                clean_frames.append((name, display_frame))  # Same for clean frames in motion view
+                
+                # Return temporary frames to pool
+                self.frame_pool.return_frame(motion_frame)
+                self.frame_pool.return_frame(gray_frame)
+                self.frame_pool.return_frame(diff_color)
+            else:
+                # For normal view, get frame from camera
+                display_frame = self.frame_pool.get_frame(camera.last_frame.shape)
+                
+                # Copy camera frame to avoid modifying original
+                np.copyto(display_frame, camera.last_frame)
+                
+                # Add camera name overlay
+                self._add_camera_overlay(display_frame, camera)
+                
+                # Add to frames list
+                frames.append((name, display_frame))
+                clean_frames.append((name, camera.last_frame))  # Original frame for recording
+        
+        # If no frames, return blank screen
+        if not frames:
+            blank = self.frame_pool.get_frame((1080, 1920, 3))
+            blank.fill(0)
+            self.clean_frame_for_recording = blank
+            return self._add_ui_elements(blank)
+        
+        # Calculate grid layout
+        n = len(frames)
+        grid_size = int(np.ceil(np.sqrt(n)))
+        cell_w = 1920 // grid_size
+        cell_h = 1080 // grid_size
+        
+        # Create output frames
+        output = self.frame_pool.get_frame((1080, 1920, 3))
+        clean_output = self.frame_pool.get_frame((1080, 1920, 3))
+        
+        # Initialize to black
+        output.fill(0)
+        clean_output.fill(0)
+        
+        # Create a single reusable cell frame
+        cell_frame = self.frame_pool.get_frame((cell_h, cell_w, 3))
+        
+        # Place frames in grid
+        for i, ((name, frame), (_, clean_frame)) in enumerate(zip(frames, clean_frames)):
+            y = (i // grid_size) * cell_h
+            x = (i % grid_size) * cell_w
+            
+            # Resize frame to cell size
+            cv2.resize(frame, (cell_w, cell_h), dst=cell_frame)
+            output[y:y+cell_h, x:x+cell_w] = cell_frame
+            
+            # Resize clean frame
+            cv2.resize(clean_frame, (cell_w, cell_h), dst=cell_frame)
+            clean_output[y:y+cell_h, x:x+cell_w] = cell_frame
+        
+        # Return cell frame to pool
+        self.frame_pool.return_frame(cell_frame)
+        
+        # Return display frames to pool
+        for _, frame in frames:
+            self.frame_pool.return_frame(frame)
+        
+        # Store clean output for recording
+        self.clean_frame_for_recording = clean_output
+        
+        # Add UI elements
+        output = self._add_ui_elements(output)
+        return output
+    
+    def _add_camera_overlay(self, frame: np.ndarray, camera: Camera) -> None:
+        """Add camera name overlay to frame"""
+        # Build the camera name text with status indicators
+        text = camera.name
+        if camera.active:
+            text += " [active]"
+            
+        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 1)[0]
+        
+        # Draw a semi-transparent background rectangle
+        h, w = frame.shape[:2]
+        bg_x = 10
+        bg_y = h - 10 - text_size[1] - 10  # 10px padding
+        bg_w = text_size[0] + 20  # 10px padding on each side
+        bg_h = text_size[1] + 10  # 5px padding on top and bottom
+        
+        # Draw semi-transparent background
+        cv2.rectangle(frame, (bg_x, bg_y), (bg_x + bg_w, bg_y + bg_h), (0, 0, 0), -1)
+        
+        # Add camera name text
+        cv2.putText(frame, text, 
+                  (bg_x + 10, bg_y + bg_h - 10), 
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+    
     def _add_ui_elements(self, frame: np.ndarray) -> np.ndarray:
-        """Add UI elements like toolbars and indicators to the frame"""
+        """Add UI elements with memory-efficient approach"""
         # Get original frame dimensions
         h, w = frame.shape[:2]
         
@@ -650,20 +935,16 @@ class WorkshopStream:
         bottom_bar_height = 50
         tab_width = w // 5  # 5 view modes
         
-        # Create a larger canvas to accommodate the toolbars
-        canvas_height = h + top_bar_height + bottom_bar_height
-        canvas = np.zeros((canvas_height, w, 3), dtype=np.uint8)
+        # Create a canvas with extra space for UI
+        canvas = self.frame_pool.get_frame((h + top_bar_height + bottom_bar_height, w, 3))
+        canvas.fill(0)
         
-        # Create top toolbar (dark gray background)
-        top_bar = np.ones((top_bar_height, w, 3), dtype=np.uint8) * 40  # Dark gray
+        # Copy frame to middle of canvas
+        canvas[top_bar_height:top_bar_height+h] = frame
         
-        # Create bottom toolbar (dark gray background)
-        bottom_bar = np.ones((bottom_bar_height, w, 3), dtype=np.uint8) * 40  # Dark gray
-        
-        # Place the frame and toolbars on the canvas
-        canvas[top_bar_height:top_bar_height+h, :] = frame  # Place frame in the middle
-        canvas[:top_bar_height, :] = top_bar  # Place top toolbar
-        canvas[top_bar_height+h:, :] = bottom_bar  # Place bottom toolbar
+        # Create top and bottom toolbars (dark gray)
+        canvas[:top_bar_height].fill(40)
+        canvas[top_bar_height+h:].fill(40)
         
         # Add tabs for each view mode
         view_modes = [
@@ -715,8 +996,7 @@ class WorkshopStream:
             cv2.putText(canvas, shortcut, (text_x, text_y), 
                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
         
-        # Create a unified status bar in the top-right corner
-        # First, determine what indicators we need to show
+        # Create status indicators if needed
         indicators = []
         
         # Add main camera name if in PIP mode
@@ -782,19 +1062,17 @@ class WorkshopStream:
             status_bar_y = top_bar_height + 10
             status_bar_x = w - total_width - padding
             
-            # Create overlay for semi-transparent background
-            overlay = canvas.copy()
-            cv2.rectangle(overlay, 
+            # Draw the rectangle for status bar background
+            cv2.rectangle(canvas, 
                         (status_bar_x, status_bar_y), 
                         (w - padding, status_bar_y + status_bar_height), 
-                        (40, 40, 40), -1)  # Dark gray background
-            cv2.addWeighted(overlay, 0.7, canvas, 0.3, 0, canvas)  # Apply transparency
+                        (40, 40, 40), -1)
             
             # Draw a subtle border around the status bar
             cv2.rectangle(canvas, 
                         (status_bar_x, status_bar_y), 
                         (w - padding, status_bar_y + status_bar_height), 
-                        (100, 100, 100), 1)  # Light gray border
+                        (100, 100, 100), 1)
             
             # Start position for the leftmost indicator
             x_pos = status_bar_x + padding
@@ -835,210 +1113,219 @@ class WorkshopStream:
                     x_pos += text_size[0] + padding
         
         return canvas
-        
-    async def _composite_output(self) -> None:
-        """Create composite output from active cameras"""
-        while self.running:
-            active_frames = []
-            
-            # collect frames from active cameras
-            for name, camera in self.cameras.items():
-                if camera.active:
-                    try:
-                        frame = await self.frame_buffer[name].get()
-                        active_frames.append((name, frame))
-                    except asyncio.QueueEmpty:
-                        continue
-            
-            if active_frames:
-                # create grid layout based on number of active cameras
-                n = len(active_frames)
-                grid_size = int(np.ceil(np.sqrt(n)))
-                cell_w = 1920 // grid_size
-                cell_h = 1080 // grid_size
-                
-                # create blank output frame
-                output = np.zeros((1080, 1920, 3), dtype=np.uint8)
-                
-                # place active frames in grid
-                for i, (name, frame) in enumerate(active_frames):
-                    y = (i // grid_size) * cell_h
-                    x = (i % grid_size) * cell_w
-                    resized = cv2.resize(frame, (cell_w, cell_h))
-                    output[y:y+cell_h, x:x+cell_w] = resized
-                
-                self.output_frame = output
-                
-            await asyncio.sleep(1/30)
-            
+
     async def start(self) -> None:
-        """Start the stream processing"""
-        log.info("starting workshop stream")
+        """Start the stream processing with explicit memory management"""
+        log.info("Starting workshop stream")
         self.running = True
         
-        # create tasks for all cameras and compositor
+        # Create tasks for all cameras
         tasks = [
             asyncio.create_task(self._capture_frames(camera))
             for camera in self.cameras.values()
         ]
-        tasks.append(asyncio.create_task(self._composite_output()))
         
         # Add debug viewer task if debug mode is enabled
         if self.debug:
-            async def debug_viewer():
-                try:
-                    while self.running:
-                        view = await self._create_debug_view()
-                        
-                        # Auto-recording based on camera activity
-                        if self.auto_recording:
-                            any_active = self._any_camera_active()
-                            
-                            # Start recording if any camera is active and we're not recording
-                            if any_active and not self.recording:
-                                self.start_recording()
-                            
-                            # Resume recording if any camera is active and recording is paused
-                            elif any_active and self.recording and self.recording_paused:
-                                self.resume_recording()
-                            
-                            # Pause recording if no camera is active and recording is not paused
-                            elif not any_active and self.recording and not self.recording_paused:
-                                # Store the time when we pause
-                                self.pause_start_time = time.time()
-                                self.pause_recording()
-                        
-                        # Push frame to recording if active
-                        if self.recording:
-                            # Use the clean_frame_for_recording which has no text overlays
-                            if hasattr(self, 'clean_frame_for_recording') and self.clean_frame_for_recording is not None:
-                                self.push_frame_to_recording(self.clean_frame_for_recording)
-                            else:
-                                # Fallback to output_frame if clean_frame_for_recording is not available
-                                if self.output_frame is not None:
-                                    self.push_frame_to_recording(self.output_frame)
-                                else:
-                                    # Last resort fallback to debug view
-                                    self.push_frame_to_recording(view)
-                        
-                        # Push frame to streaming if active
-                        if self.streaming:
-                            # Use the clean_frame_for_recording which has no text overlays
-                            if hasattr(self, 'clean_frame_for_recording') and self.clean_frame_for_recording is not None:
-                                self.push_frame_to_streaming(self.clean_frame_for_recording)
-                            else:
-                                # Fallback to output_frame if clean_frame_for_recording is not available
-                                if self.output_frame is not None:
-                                    self.push_frame_to_streaming(self.output_frame)
-                                else:
-                                    # Last resort fallback to debug view
-                                    self.push_frame_to_streaming(view)
-                        
-                        cv2.imshow('Debug View', view)
-                        
-                        key = cv2.waitKey(1) & 0xFF
-                        if key == ord('q'):
-                            raise KeyboardInterrupt
-                        # Number keys for view modes (1-5)
-                        elif key == ord('1'):
-                            self.view_mode = ViewMode.GRID
-                        elif key == ord('2'):
-                            self.view_mode = ViewMode.ACTIVE
-                        elif key == ord('3'):
-                            self.view_mode = ViewMode.OUTPUT
-                        elif key == ord('4'):
-                            self.view_mode = ViewMode.MOTION
-                        elif key == ord('5'):
-                            self.view_mode = ViewMode.PIP
-                        # Letter shortcuts for other functions
-                        elif key == ord('a'):  # 'a' to toggle auto-recording
-                            self.auto_recording = not self.auto_recording
-                            log.info(f"Auto-recording {'enabled' if self.auto_recording else 'disabled'}")
-                        elif key == ord('t'):  # 't' to toggle streaming
-                            self.toggle_streaming()
-                        elif key == ord('s'):  # 's' to start/stop recording
-                            if self.recording:
-                                self.stop_recording()
-                            else:
-                                self.start_recording()
-                        elif key == ord('\t') and self.view_mode == ViewMode.PIP:
-                            log.info(f"TAB pressed. Cycling camera selection.")
-                            
-                            # Get list of active cameras
-                            active_cameras = [name for name, cam in self.cameras.items() if cam.active]
-                            
-                            if active_cameras:
-                                # Check if we're currently in auto mode (no manual selection)
-                                any_manual = any(cam.manual_main for cam in self.cameras.values())
-                                
-                                # If in auto mode, select the first camera
-                                if not any_manual:
-                                    # Select the first active camera
-                                    first_camera = self.cameras[active_cameras[0]]
-                                    first_camera.manual_main = True
-                                    log.info(f"Switching from auto mode to manual camera: {active_cameras[0]}")
-                                else:
-                                    # Find the current manually selected camera
-                                    current_manual = next((name for name, cam in self.cameras.items() 
-                                                        if cam.manual_main), None)
-                                    
-                                    if current_manual in active_cameras:
-                                        # Find the next camera in the cycle
-                                        current_idx = active_cameras.index(current_manual)
-                                        next_idx = (current_idx + 1) % (len(active_cameras) + 1)  # +1 for auto mode
-                                        
-                                        # Reset all manual selections
-                                        for cam in self.cameras.values():
-                                            cam.manual_main = False
-                                        
-                                        # If next_idx is within active_cameras, select that camera
-                                        # Otherwise, it means we've cycled back to auto mode
-                                        if next_idx < len(active_cameras):
-                                            next_camera = self.cameras[active_cameras[next_idx]]
-                                            next_camera.manual_main = True
-                                            log.info(f"Manually selected camera: {active_cameras[next_idx]}")
-                                        else:
-                                            # Auto mode - no manual selection
-                                            log.info("Switched to auto camera selection mode")
-                                    else:
-                                        # Current manual camera is not active, reset to auto mode
-                                        for cam in self.cameras.values():
-                                            cam.manual_main = False
-                                        log.info("Reset to auto camera selection mode")
-
-                        await asyncio.sleep(1/30)
-                finally:
-                    cv2.destroyAllWindows()
-                    if self.recording:
-                        self.stop_recording()
-            
-            tasks.append(asyncio.create_task(debug_viewer()))
+            tasks.append(asyncio.create_task(self._run_debug_viewer()))
         
         try:
             await asyncio.gather(*tasks)
         except (KeyboardInterrupt, asyncio.CancelledError):
             log.info("Shutting down...")
             self.running = False
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            self.stop()
+    
+    async def _run_debug_viewer(self):
+        """Run debug viewer with memory management"""
+        try:
+            while self.running:
+                # Create debug view
+                view = await self._create_debug_view()
+                
+                # Handle auto-recording based on camera activity
+                self._handle_auto_recording()
+                
+                # Handle recording and streaming
+                self._handle_recording_and_streaming(view)
+                
+                # Show the view
+                cv2.imshow('Debug View', view)
+                
+                # Process keyboard input
+                key = cv2.waitKey(1) & 0xFF
+                self._handle_keyboard_input(key)
+                
+                # Return view frame to pool
+                self.frame_pool.return_frame(view)
+                
+                # Run garbage collection periodically
+                if self.frame_count % 300 == 0:  # Every 10 seconds at 30fps
+                    gc.collect()
+                
+                # Sleep to maintain frame rate
+                await asyncio.sleep(1/30)
+        finally:
+            cv2.destroyAllWindows()
             if self.recording:
                 self.stop_recording()
             if self.streaming:
                 self.stop_streaming()
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
+    
+    def _handle_auto_recording(self):
+        """Handle auto-recording logic"""
+        if not self.auto_recording:
+            return
+            
+        any_active = self._any_camera_active()
         
+        # Start recording if any camera is active and we're not recording
+        if any_active and not self.recording:
+            self.start_recording()
+        
+        # Resume recording if any camera is active and recording is paused
+        elif any_active and self.recording and self.recording_paused:
+            self.resume_recording()
+        
+        # Pause recording if no camera is active and recording is not paused
+        elif not any_active and self.recording and not self.recording_paused:
+            # Store the time when we pause
+            self.pause_start_time = time.time()
+            self.pause_recording()
+    
+    def _handle_recording_and_streaming(self, view):
+        """Handle recording and streaming of frames"""
+        # Push frame to recording if active
+        if self.recording:
+            # Use the clean_frame_for_recording which has no text overlays
+            if self.clean_frame_for_recording is not None:
+                self.push_frame_to_recording(self.clean_frame_for_recording)
+            else:
+                # Fallback to view
+                self.push_frame_to_recording(view)
+        
+        # Push frame to streaming if active
+        if self.streaming:
+            # Use the clean_frame_for_recording which has no text overlays
+            if self.clean_frame_for_recording is not None:
+                self.push_frame_to_streaming(self.clean_frame_for_recording)
+            else:
+                # Fallback to view
+                self.push_frame_to_streaming(view)
+    
+    def _handle_keyboard_input(self, key):
+        """Handle keyboard input for the debug viewer"""
+        if key == ord('q'):
+            raise KeyboardInterrupt
+        
+        # Number keys for view modes (1-5)
+        elif key == ord('1'):
+            self.view_mode = ViewMode.GRID
+        elif key == ord('2'):
+            self.view_mode = ViewMode.ACTIVE
+        elif key == ord('3'):
+            self.view_mode = ViewMode.OUTPUT
+        elif key == ord('4'):
+            self.view_mode = ViewMode.MOTION
+        elif key == ord('5'):
+            self.view_mode = ViewMode.PIP
+        
+        # Letter shortcuts for other functions
+        elif key == ord('a'):  # 'a' to toggle auto-recording
+            self.auto_recording = not self.auto_recording
+            log.info(f"Auto-recording {'enabled' if self.auto_recording else 'disabled'}")
+        elif key == ord('t'):  # 't' to toggle streaming
+            self.toggle_streaming()
+        elif key == ord('s'):  # 's' to start/stop recording
+            if self.recording:
+                self.stop_recording()
+            else:
+                self.start_recording()
+        elif key == ord('\t') and self.view_mode == ViewMode.PIP:
+            self._cycle_main_camera()
+    
+    def _cycle_main_camera(self):
+        """Cycle through cameras for PiP mode"""
+        log.info("TAB pressed. Cycling camera selection.")
+        
+        # Get list of active cameras
+        active_cameras = [name for name, cam in self.cameras.items() if cam.active]
+        
+        if not active_cameras:
+            return
+            
+        # Check if we're currently in auto mode (no manual selection)
+        any_manual = any(cam.manual_main for cam in self.cameras.values())
+        
+        # If in auto mode, select the first camera
+        if not any_manual:
+            # Select the first active camera
+            first_camera = self.cameras[active_cameras[0]]
+            first_camera.manual_main = True
+            log.info(f"Switching from auto mode to manual camera: {active_cameras[0]}")
+        else:
+            # Find the current manually selected camera
+            current_manual = next((name for name, cam in self.cameras.items() 
+                                if cam.manual_main), None)
+            
+            if current_manual in active_cameras:
+                # Find the next camera in the cycle
+                current_idx = active_cameras.index(current_manual)
+                next_idx = (current_idx + 1) % (len(active_cameras) + 1)  # +1 for auto mode
+                
+                # Reset all manual selections
+                for cam in self.cameras.values():
+                    cam.manual_main = False
+                
+                # If next_idx is within active_cameras, select that camera
+                # Otherwise, it means we've cycled back to auto mode
+                if next_idx < len(active_cameras):
+                    next_camera = self.cameras[active_cameras[next_idx]]
+                    next_camera.manual_main = True
+                    log.info(f"Manually selected camera: {active_cameras[next_idx]}")
+                else:
+                    # Auto mode - no manual selection
+                    log.info("Switched to auto camera selection mode")
+            else:
+                # Current manual camera is not active, reset to auto mode
+                for cam in self.cameras.values():
+                    cam.manual_main = False
+                log.info("Reset to auto camera selection mode")
+            
     def stop(self) -> None:
-        """Stop the stream processing"""
+        """Stop the stream processing and clean up resources"""
         self.running = False
+        
+        # Stop recording and streaming
         if self.recording:
             self.stop_recording()
         if self.streaming:
             self.stop_streaming()
+        
+        # Clean up cameras
+        for camera in self.cameras.values():
+            camera.cleanup()
+        
+        # Clean up GStreamer buffers
+        self.recording_buffer.cleanup()
+        self.streaming_buffer.cleanup()
+        
+        # Clean up other resources
         if self.debug:
             cv2.destroyAllWindows()
         
+        # Clear references to large objects
+        self.clean_frame_for_recording = None
+        self.output_frame = None
+        
+        # Run garbage collection
+        gc.collect()
+
 if __name__ == "__main__":
-    # quick test with debug viewer
+    # Quick test with debug viewer
     stream = WorkshopStream(debug=True)
     stream.add_camera("3", "desk")
     # stream.add_camera("rtsp://192.168.68.123:8080/h264_pcm.sdp", "desk")
