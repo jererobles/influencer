@@ -2,18 +2,14 @@ import asyncio
 import cv2
 import numpy as np
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Literal
+from typing import Dict, Optional, Tuple
 from enum import Enum, auto
 import logging
 import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
 import os
 import gi
 gi.require_version('Gst', '1.0')
-from gi.repository import Gst, GLib
-from threading import Thread
-import sys
+from gi.repository import Gst
 import time
 import datetime
 import yaml  # Add import for yaml to load secrets
@@ -42,6 +38,10 @@ class Camera:
     last_active_time: float = 0  # timestamp when camera last became active
     main_camera: bool = False    # is this the main camera in PiP mode?
     manual_main: bool = False    # was this camera manually selected as main
+    frame_rate: float = 30.0     # native frame rate of the camera
+    last_frame_time: float = 0   # timestamp of the last frame
+    connection_lost: bool = False # track if connection is currently lost
+    last_frame: Optional[np.ndarray] = None
     
     # Memory management
     pipeline: Optional[Gst.Pipeline] = None
@@ -164,8 +164,6 @@ class WorkshopStream:
         
         # Memory management
         self.frame_pool = FramePool()
-        self.recording_buffer = GstBuffer()
-        self.streaming_buffer = GstBuffer()
         
         # Load secrets
         self.twitch_stream_key = self._load_twitch_stream_key()
@@ -209,7 +207,7 @@ class WorkshopStream:
         if camera.url.isdigit():  # USB webcam
             pipeline_str = (
                 f'avfvideosrc device-index={camera.url} ! '
-                'video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1 ! '
+                'video/x-raw,format=YUY2,width=1920,height=1080,framerate=60/1 ! '
                 'videoconvert ! video/x-raw,format=BGR ! '
                 'appsink name=sink emit-signals=True max-buffers=1 drop=True'
             )
@@ -222,7 +220,8 @@ class WorkshopStream:
             )
         else:  # RTSP stream
             pipeline_str = (
-                f'rtspsrc location={camera.url} latency=0 ! '
+                f'rtspsrc location={camera.url} latency=0 retry=1 drop-on-latency=true do-retransmission=true ntp-sync=true buffer-mode=auto ! '
+                'queue max-size-buffers=2 ! '
                 'rtph264depay ! h264parse ! avdec_h264 ! '
                 'videoconvert ! video/x-raw,format=BGR ! '
                 'appsink name=sink emit-signals=True max-buffers=1 drop=True'
@@ -247,42 +246,38 @@ class WorkshopStream:
         # Setup frame callback
         def on_new_sample(appsink):
             try:
-                # Get stream reference
+                # Get the stream reference
                 stream = stream_ref()
-                if stream is None or not stream.running:
-                    return Gst.FlowReturn.OK
-                    
-                sample = appsink.emit('pull-sample')
+                if not stream:
+                    return Gst.FlowReturn.ERROR
+                
+                camera.last_frame_time = time.time()
+                camera.connection_lost = False  # We got a frame, so connection is not lost
+                
+                # Get the sample from appsink
+                sample = appsink.emit("pull-sample")
                 if not sample:
-                    return Gst.FlowReturn.OK
-                    
-                buf = sample.get_buffer()
-                caps = sample.get_caps()
+                    return Gst.FlowReturn.ERROR
                 
-                structure = caps.get_structure(0)
-                width = structure.get_value('width')
-                height = structure.get_value('height')
+                # Get the buffer from the sample
+                buffer = sample.get_buffer()
+                if not buffer:
+                    return Gst.FlowReturn.ERROR
                 
-                # Get buffer data
-                success, map_info = buf.map(Gst.MapFlags.READ)
+                # Map the buffer to get the raw data
+                success, map_info = buffer.map(Gst.MapFlags.READ)
                 if not success:
-                    return Gst.FlowReturn.OK
-                    
+                    return Gst.FlowReturn.ERROR
+                
                 try:
-                    # Create a zero-copy view into the buffer
-                    array_view = np.ndarray(
-                        shape=(height, width, 3),
+                    # Convert buffer to numpy array
+                    frame = np.ndarray(
+                        shape=(camera.resolution[1], camera.resolution[0], 3),
                         dtype=np.uint8,
                         buffer=map_info.data
                     )
                     
                     # Get a reusable frame from the pool
-                    frame = stream.frame_pool.get_frame((height, width, 3))
-                    
-                    # Copy data only once - directly from the mapped buffer to our frame
-                    np.copyto(frame, array_view)
-                    
-                    # Store frame reference
                     old_frame = camera.last_frame
                     camera.last_frame = frame
                     
@@ -345,7 +340,7 @@ class WorkshopStream:
                         
                 finally:
                     # Always unmap the buffer
-                    buf.unmap(map_info)
+                    buffer.unmap(map_info)
                     
             except Exception as e:
                 log.error(f"Error in frame callback: {e}")
@@ -361,9 +356,42 @@ class WorkshopStream:
         # Main loop to keep pipeline running
         try:
             while self.running:
-                await asyncio.sleep(0.001)  # Minimal sleep to allow other tasks
+                # Check for connection loss every 0.5 seconds
+                current_time = time.time()
+                if current_time - camera.last_frame_time > 2.0 and camera.last_frame_time > 0:
+                    if not camera.connection_lost:
+                        log.warning(f"Connection lost for camera {camera.name}")
+                        camera.connection_lost = True
+                        
+                        # Apply visual feedback to the last frame if we have one
+                        if camera.last_frame is not None:
+                            frame = camera.last_frame.copy()  # Make a copy to avoid modifying the original
+                            
+                            # Apply a strong Gaussian blur
+                            frame = cv2.GaussianBlur(frame, (99, 99), 30)
+                            
+                            # Add "Connection dropped, retrying" text
+                            text = "Connection dropped, retrying"
+                            font = cv2.FONT_HERSHEY_DUPLEX
+                            font_scale = frame.shape[1] / 1000  # Scale based on image width
+                            thickness = max(2, int(font_scale * 2))
+                            
+                            # Get text size and calculate position
+                            (text_width, text_height), _ = cv2.getTextSize(text, font, font_scale, thickness)
+                            x = (frame.shape[1] - text_width) // 2
+                            y = (frame.shape[0] + text_height) // 2
+                            
+                            # Draw text with background for better visibility
+                            cv2.putText(frame, text, (x, y), font, font_scale, (255, 255, 255), thickness + 2)
+                            cv2.putText(frame, text, (x, y), font, font_scale, (0, 0, 0), thickness)
+                            
+                            # Update the last frame with the visual feedback
+                            camera.last_frame = frame
+                
+                await asyncio.sleep(0.5)
+                
         except Exception as e:
-            log.error(f"Error in pipeline loop: {e}")
+            log.error(f"Error in capture loop for {camera.name}: {e}")
         finally:
             # Cleanup
             self._cleanup_camera(camera)
@@ -442,9 +470,9 @@ class WorkshopStream:
         # Create GStreamer pipeline for recording
         pipeline_str = (
             'appsrc name=src is-live=true format=time do-timestamp=true ! '
-            'video/x-raw,format=BGR,width=1920,height=1080,framerate=30/1 ! '
+            'video/x-raw,format=BGR,width=1920,height=1080,framerate=60/1 ! '
             'videoconvert ! video/x-raw,format=I420 ! '
-            'x264enc speed-preset=superfast tune=zerolatency bitrate=8000 key-int-max=30 ! '
+            'x264enc speed-preset=superfast tune=zerolatency bitrate=10000 key-int-max=60 ! '
             'h264parse ! matroskamux ! '
             f'filesink location={output_file}'
         )
@@ -555,9 +583,9 @@ class WorkshopStream:
         # Create GStreamer pipeline for streaming to Twitch
         pipeline_str = (
             'appsrc name=src is-live=true format=time do-timestamp=true ! '
-            'video/x-raw,format=BGR,width=1920,height=1080,framerate=30/1 ! '
+            'video/x-raw,format=BGR,width=1920,height=1080,framerate=60/1 ! '
             'videoconvert ! video/x-raw,format=I420 ! '
-            'x264enc speed-preset=veryfast tune=zerolatency bitrate=2500 key-int-max=60 ! '
+            'x264enc speed-preset=veryfast tune=zerolatency bitrate=3500 key-int-max=60 ! '
             'h264parse ! flvmux streamable=true ! '
             f'rtmpsink location=rtmp://live.twitch.tv/app/{self.twitch_stream_key} sync=false'
         )
@@ -629,22 +657,11 @@ class WorkshopStream:
         # Get frame size
         required_size = frame.nbytes
         
-        # Ensure our buffer is large enough
-        self.recording_buffer.ensure_size(required_size)
-        
-        # Get numpy view of our reusable buffer
-        np_buffer = np.frombuffer(self.recording_buffer.buffer, dtype=np.uint8)
-        np_buffer = np_buffer[:required_size].reshape(frame.shape)
-        
-        # Copy frame data into our buffer
-        np.copyto(np_buffer, frame)
-        
-        # Create GStreamer buffer with our data
-        gst_buffer = Gst.Buffer.new_allocate(None, required_size, None)
-        gst_buffer.fill(0, self.recording_buffer.get_view(required_size))
+        # Create GStreamer buffer directly from frame data
+        gst_buffer = Gst.Buffer.new_wrapped(frame.tobytes())
         
         # Set buffer timestamp
-        duration = 1 / 30 * Gst.SECOND  # Assuming 30 fps
+        duration = 1 / 60 * Gst.SECOND  # Using 60 fps
         pts = (time.time() - self.start_time) * Gst.SECOND
         gst_buffer.pts = pts
         gst_buffer.duration = duration
@@ -663,25 +680,11 @@ class WorkshopStream:
         if not self.streaming or self.streaming_src is None:
             return
         
-        # Get frame size
-        required_size = frame.nbytes
-        
-        # Ensure our buffer is large enough
-        self.streaming_buffer.ensure_size(required_size)
-        
-        # Get numpy view of our reusable buffer
-        np_buffer = np.frombuffer(self.streaming_buffer.buffer, dtype=np.uint8)
-        np_buffer = np_buffer[:required_size].reshape(frame.shape)
-        
-        # Copy frame data into our buffer
-        np.copyto(np_buffer, frame)
-        
-        # Create GStreamer buffer with our data
-        gst_buffer = Gst.Buffer.new_allocate(None, required_size, None)
-        gst_buffer.fill(0, self.streaming_buffer.get_view(required_size))
+        # Create GStreamer buffer directly from frame data
+        gst_buffer = Gst.Buffer.new_wrapped(frame.tobytes())
         
         # Set buffer timestamp
-        duration = 1 / 30 * Gst.SECOND  # Assuming 30 fps
+        duration = 1 / 60 * Gst.SECOND  # Using 60 fps
         pts = time.time() * Gst.SECOND
         gst_buffer.pts = pts
         gst_buffer.duration = duration
@@ -907,6 +910,9 @@ class WorkshopStream:
         text = camera.name
         if camera.active:
             text += " [active]"
+            
+        # Add FPS indicator
+        text += f" ({camera.frame_rate:.1f} fps)"
             
         text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 1)[0]
         
@@ -1163,11 +1169,11 @@ class WorkshopStream:
                 self.frame_pool.return_frame(view)
                 
                 # Run garbage collection periodically
-                if self.frame_count % 300 == 0:  # Every 10 seconds at 30fps
+                if self.frame_count % 600 == 0:  # Every 10 seconds at 60fps
                     gc.collect()
                 
                 # Sleep to maintain frame rate
-                await asyncio.sleep(1/30)
+                await asyncio.sleep(1/60)
         finally:
             cv2.destroyAllWindows()
             if self.recording:
@@ -1309,9 +1315,7 @@ class WorkshopStream:
         for camera in self.cameras.values():
             camera.cleanup()
         
-        # Clean up GStreamer buffers
-        self.recording_buffer.cleanup()
-        self.streaming_buffer.cleanup()
+        # No GStreamer buffers to clean up anymore
         
         # Clean up other resources
         if self.debug:
@@ -1327,8 +1331,8 @@ class WorkshopStream:
 if __name__ == "__main__":
     # Quick test with debug viewer
     stream = WorkshopStream(debug=True)
-    stream.add_camera("3", "desk")
-    # stream.add_camera("rtsp://192.168.68.123:8080/h264_pcm.sdp", "desk")
+    stream.add_camera("rtsp://192.168.68.123:8080/h264_pcm.sdp", "kitchen")
+    # stream.add_camera("4", "desk")
     # stream.add_camera("rtsp://192.168.1.112:8080/h264_pcm.sdp", "wide")
     
     print("Debug controls:")
