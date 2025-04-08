@@ -37,17 +37,18 @@ class Camera:
     active: bool = False
     last_active_time: float = 0  # timestamp when camera last became active
     main_camera: bool = False    # is this the main camera in PiP mode?
-    manual_main: bool = False    # was this camera manually selected as main
+    manual_main: bool = False    # manually selected as main camera
+    pipeline: Optional[Gst.Pipeline] = None
+    sink: Optional[Gst.Element] = None
+    last_frame_time: float = 0   # timestamp of last received frame
+    connection_lost: bool = False  # flag for connection status
+    retry_count: int = 0         # count of reconnection attempts
+    max_retries: int = 10        # maximum number of reconnection attempts
+    retry_interval: float = 5.0  # seconds between retry attempts
     frame_rate: float = 30.0     # native frame rate of the camera
-    last_frame_time: float = 0   # timestamp of the last frame
-    connection_lost: bool = False # track if connection is currently lost
     last_frame: Optional[np.ndarray] = None
     
     # Memory management
-    pipeline: Optional[Gst.Pipeline] = None
-    sink: Optional[Gst.Element] = None
-    
-    # Use a property for last_frame to control reference handling
     _last_frame: Optional[np.ndarray] = None
     
     @property
@@ -209,24 +210,26 @@ class WorkshopStream:
                 f'avfvideosrc device-index={camera.url} ! '
                 'video/x-raw,format=YUY2,width=1920,height=1080,framerate=60/1 ! '
                 'videoconvert ! video/x-raw,format=BGR ! '
-                'appsink name=sink emit-signals=True max-buffers=1 drop=True'
+                'appsink name=sink emit-signals=True max-buffers=4096 drop=False'
             )
         elif camera.url.startswith('http://'):  # HTTP stream
             pipeline_str = (
                 f'souphttpsrc location={camera.url} ! '
-                'decodebin ! videoconvert ! '
-                'video/x-raw,format=BGR ! '
-                'appsink name=sink emit-signals=True max-buffers=1 drop=True'
+                'decodebin ! videoconvert ! video/x-raw,format=BGR ! '
+                'appsink name=sink emit-signals=True max-buffers=4096 drop=False'
             )
         else:  # RTSP stream
             pipeline_str = (
-                f'rtspsrc location={camera.url} latency=0 retry=1 drop-on-latency=true do-retransmission=true ntp-sync=true buffer-mode=auto ! '
-                'queue max-size-buffers=2 ! '
-                'rtph264depay ! h264parse ! avdec_h264 ! '
+                f'rtspsrc location={camera.url} latency=100 buffer-mode=auto do-retransmission=true '
+                'drop-on-latency=false ntp-sync=false protocols=tcp ! '
+                'rtpjitterbuffer latency=500 drop-on-latency=false ! '
+                'queue max-size-buffers=4096 max-size-bytes=0 max-size-time=0 ! '
+                'rtph264depay ! h264parse ! '
+                'avdec_h264 max-threads=4 ! '
                 'videoconvert ! video/x-raw,format=BGR ! '
-                'appsink name=sink emit-signals=True max-buffers=1 drop=True'
+                'appsink name=sink emit-signals=True max-buffers=4096 drop=False'
             )
-        
+
         log.info(f"Creating pipeline for {camera.name}: {pipeline_str}")
         
         # Create and store the pipeline in the camera object
@@ -237,165 +240,163 @@ class WorkshopStream:
         """Capture frames from a camera and detect people"""
         detection_counter = 0
         
-        # Create GStreamer pipeline for this camera
-        self._create_camera_pipeline(camera)
-        
-        # Create a reference to self that won't prevent garbage collection
-        stream_ref = weakref.ref(self)
-        
-        # Setup frame callback
-        def on_new_sample(appsink):
+        while self.running:
             try:
-                # Get the stream reference
-                stream = stream_ref()
-                if not stream:
-                    return Gst.FlowReturn.ERROR
-                
-                camera.last_frame_time = time.time()
-                camera.connection_lost = False  # We got a frame, so connection is not lost
-                
-                # Get the sample from appsink
-                sample = appsink.emit("pull-sample")
-                if not sample:
-                    return Gst.FlowReturn.ERROR
-                
-                # Get the buffer from the sample
-                buffer = sample.get_buffer()
-                if not buffer:
-                    return Gst.FlowReturn.ERROR
-                
-                # Map the buffer to get the raw data
-                success, map_info = buffer.map(Gst.MapFlags.READ)
-                if not success:
-                    return Gst.FlowReturn.ERROR
-                
-                try:
-                    # Convert buffer to numpy array
-                    frame = np.ndarray(
-                        shape=(camera.resolution[1], camera.resolution[0], 3),
-                        dtype=np.uint8,
-                        buffer=map_info.data
-                    )
+                # Create GStreamer pipeline for this camera
+                self._create_camera_pipeline(camera)
+
+                # Create a reference to self that won't prevent garbage collection
+                stream_ref = weakref.ref(self)
+
+                # Setup frame callback
+                def on_new_sample(appsink):
+                    try:
+                        # Get the stream reference
+                        stream = stream_ref()
+                        if not stream:
+                            return Gst.FlowReturn.ERROR
+
+                        camera.last_frame_time = time.time()
+                        camera.connection_lost = False  # We got a frame, so connection is not lost
+                        camera.retry_count = 0  # Reset retry count on successful frame
+
+                        # Get the sample from appsink
+                        sample = appsink.emit("pull-sample")
+                        if not sample:
+                            return Gst.FlowReturn.ERROR
+
+                        # Get the buffer from the sample
+                        buffer = sample.get_buffer()
+                        if not buffer:
+                            return Gst.FlowReturn.ERROR
+
+                        # Map the buffer for reading
+                        success, map_info = buffer.map(Gst.MapFlags.READ)
+                        if not success:
+                            return Gst.FlowReturn.ERROR
+
+                        try:
+                            # Get a reusable frame from the pool
+                            old_frame = camera.last_frame
+                            camera.last_frame = np.ndarray(
+                                shape=(camera.resolution[1], camera.resolution[0], 3),
+                                dtype=np.uint8,
+                                buffer=map_info.data
+                            )
+                            
+                            # Return old frame to the pool
+                            if old_frame is not None:
+                                stream.frame_pool.return_frame(old_frame)
+                            
+                            # Handle detection on a subset of frames
+                            nonlocal detection_counter
+                            detection_counter += 1
+                            
+                            if detection_counter % 10 == 0:  # Every 10th frame
+                                # Get a frame for detection resizing
+                                small_frame = cv2.resize(camera.last_frame, camera.detection_res)
+                                
+                                # Convert to RGB for MediaPipe
+                                small_frame_rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+                                
+                                # Create MediaPipe image
+                                mp_image = mp.Image(
+                                    image_format=mp.ImageFormat.SRGB,
+                                    data=small_frame_rgb
+                                )
+                                
+                                # Run detection
+                                results = stream.detector.detect(mp_image)
+                                
+                                # Update camera state
+                                camera.face_count = len(results.detections)
+                                if camera.face_count > 0:
+                                    if not camera.active:
+                                        log.info(f"Camera {camera.name} became active")
+                                    camera.active = True
+                                    camera.cooldown = 30
+                                    camera.last_active_time = time.time()
+                                elif camera.cooldown > 0:
+                                    camera.cooldown -= 1
+                                else:
+                                    if camera.active:
+                                        log.info(f"Camera {camera.name} became inactive")
+                                    camera.active = False
+                                    camera.face_count = 0
+                                
+                                # Calculate motion score
+                                # Convert to grayscale for motion detection
+                                gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+                                
+                                if camera.previous_frame is not None:
+                                    # Calculate difference for motion detection
+                                    diff = cv2.absdiff(camera.previous_frame, gray)
+                                    camera.motion_score = np.mean(diff) / 255.0
+                                
+                                # Save current frame for next motion detection
+                                camera.previous_frame = gray
+                                
+                                # Clean up temporary objects
+                                del small_frame
+                                del small_frame_rgb
+                                del mp_image
+
+                        finally:
+                            # Always unmap the buffer
+                            buffer.unmap(map_info)
+
+                    except Exception as e:
+                        log.error(f"Error in frame callback: {e}")
+                        return Gst.FlowReturn.ERROR
+
+                    return Gst.FlowReturn.OK
+
+                # Connect callback and start pipeline
+                camera.sink.connect('new-sample', on_new_sample)
+                camera.pipeline.set_state(Gst.State.PLAYING)
+
+                log.info(f"Pipeline started for {camera.name}")
+
+                # Main loop to keep pipeline running and check for connection loss
+                while self.running:
+                    current_time = time.time()
                     
-                    # Get a reusable frame from the pool
-                    old_frame = camera.last_frame
-                    camera.last_frame = frame
-                    
-                    # Return old frame to the pool
-                    if old_frame is not None:
-                        stream.frame_pool.return_frame(old_frame)
-                        
-                    # Handle detection on a subset of frames
-                    nonlocal detection_counter
-                    detection_counter += 1
-                    
-                    if detection_counter % 10 == 0:  # Every 10th frame
-                        # Get a frame for detection resizing
-                        small_frame = cv2.resize(frame, camera.detection_res)
-                        
-                        # Convert to RGB for MediaPipe
-                        small_frame_rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-                        
-                        # Create MediaPipe image
-                        mp_image = mp.Image(
-                            image_format=mp.ImageFormat.SRGB,
-                            data=small_frame_rgb
-                        )
-                        
-                        # Run detection
-                        results = stream.detector.detect(mp_image)
-                        
-                        # Update camera state
-                        camera.face_count = len(results.detections)
-                        if camera.face_count > 0:
-                            if not camera.active:
-                                log.info(f"Camera {camera.name} became active")
-                            camera.active = True
-                            camera.cooldown = 30
-                            camera.last_active_time = time.time()
-                        elif camera.cooldown > 0:
-                            camera.cooldown -= 1
-                        else:
-                            if camera.active:
-                                log.info(f"Camera {camera.name} became inactive")
-                            camera.active = False
-                            camera.face_count = 0
-                        
-                        # Calculate motion score
-                        # Convert to grayscale for motion detection
-                        gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-                        
-                        if camera.previous_frame is not None:
-                            # Calculate difference for motion detection
-                            diff = cv2.absdiff(camera.previous_frame, gray)
-                            camera.motion_score = np.mean(diff) / 255.0
-                        
-                        # Save current frame for next motion detection
-                        camera.previous_frame = gray
-                        
-                        # Clean up temporary objects
-                        del small_frame
-                        del small_frame_rgb
-                        del mp_image
-                        
-                finally:
-                    # Always unmap the buffer
-                    buffer.unmap(map_info)
-                    
-            except Exception as e:
-                log.error(f"Error in frame callback: {e}")
-                
-            return Gst.FlowReturn.OK
-        
-        # Connect callback and start pipeline
-        camera.sink.connect('new-sample', on_new_sample)
-        camera.pipeline.set_state(Gst.State.PLAYING)
-        
-        log.info(f"Pipeline started for {camera.name}")
-        
-        # Main loop to keep pipeline running
-        try:
-            while self.running:
-                # Check for connection loss every 0.5 seconds
-                current_time = time.time()
-                if current_time - camera.last_frame_time > 2.0 and camera.last_frame_time > 0:
-                    if not camera.connection_lost:
-                        log.warning(f"Connection lost for camera {camera.name}")
+                    # Check for connection loss (no frames for 3 seconds)
+                    if not camera.connection_lost and current_time - camera.last_frame_time > 3:
                         camera.connection_lost = True
+                        log.warning(f"Connection lost to camera {camera.name}")
                         
-                        # Apply visual feedback to the last frame if we have one
-                        if camera.last_frame is not None:
-                            frame = camera.last_frame.copy()  # Make a copy to avoid modifying the original
-                            
-                            # Apply a strong Gaussian blur
-                            frame = cv2.GaussianBlur(frame, (99, 99), 30)
-                            
-                            # Add "Connection dropped, retrying" text
-                            text = "Connection dropped, retrying"
-                            font = cv2.FONT_HERSHEY_DUPLEX
-                            font_scale = frame.shape[1] / 1000  # Scale based on image width
-                            thickness = max(2, int(font_scale * 2))
-                            
-                            # Get text size and calculate position
-                            (text_width, text_height), _ = cv2.getTextSize(text, font, font_scale, thickness)
-                            x = (frame.shape[1] - text_width) // 2
-                            y = (frame.shape[0] + text_height) // 2
-                            
-                            # Draw text with background for better visibility
-                            cv2.putText(frame, text, (x, y), font, font_scale, (255, 255, 255), thickness + 2)
-                            cv2.putText(frame, text, (x, y), font, font_scale, (0, 0, 0), thickness)
-                            
-                            # Update the last frame with the visual feedback
-                            camera.last_frame = frame
+                        # Clean up the existing pipeline
+                        self._cleanup_camera(camera)
+                        
+                        # Check retry limits
+                        if camera.retry_count >= camera.max_retries:
+                            log.error(f"Max retries ({camera.max_retries}) reached for camera {camera.name}")
+                            break
+                        
+                        # Increment retry count and wait before next attempt
+                        camera.retry_count += 1
+                        log.info(f"Attempting reconnection to {camera.name} (attempt {camera.retry_count}/{camera.max_retries})")
+                        await asyncio.sleep(camera.retry_interval)
+                        break  # Break inner loop to recreate pipeline
+                    
+                    await asyncio.sleep(0.5)  # Check connection every 0.5 seconds
+
+            except Exception as e:
+                log.error(f"Error in camera pipeline {camera.name}: {e}")
+                self._cleanup_camera(camera)
                 
-                await asyncio.sleep(0.5)
-                
-        except Exception as e:
-            log.error(f"Error in capture loop for {camera.name}: {e}")
-        finally:
-            # Cleanup
-            self._cleanup_camera(camera)
-            log.info(f"Pipeline stopped for {camera.name}")
+                # Handle retries
+                if camera.retry_count < camera.max_retries:
+                    camera.retry_count += 1
+                    log.info(f"Attempting reconnection to {camera.name} (attempt {camera.retry_count}/{camera.max_retries})")
+                    await asyncio.sleep(camera.retry_interval)
+                else:
+                    log.error(f"Max retries ({camera.max_retries}) reached for camera {camera.name}")
+                    break
+
+        # Final cleanup
+        self._cleanup_camera(camera)
     
     def _cleanup_camera(self, camera: Camera) -> None:
         """Clean up camera resources"""
@@ -1332,7 +1333,7 @@ if __name__ == "__main__":
     # Quick test with debug viewer
     stream = WorkshopStream(debug=True)
     stream.add_camera("rtsp://192.168.68.123:8080/h264_pcm.sdp", "kitchen")
-    # stream.add_camera("4", "desk")
+    stream.add_camera("4", "desk")
     # stream.add_camera("rtsp://192.168.1.112:8080/h264_pcm.sdp", "wide")
     
     print("Debug controls:")
