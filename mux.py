@@ -1629,18 +1629,20 @@ class WorkshopStream:
             # Add glowing effect for recording/streaming shortcuts with animation
             if "Recording" in shortcut and self.recording:
                 # Create animated glow effect for recording
-                for radius in range(3, 0, -1):
-                    glow_alpha = (0.3 - (radius * 0.1)) * pulse_factor
+                for radius in range(5, 0, -1):  # Increased number of layers
+                    glow_alpha = (0.5 - (radius * 0.1)) * pulse_factor  # Increased base alpha
                     glow_color = (0, 0, int(255 * glow_alpha))
+                    # Draw glow with increasing thickness
                     cv2.putText(canvas, shortcut, (text_x, text_y), 
-                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, glow_color, thickness + radius, cv2.LINE_AA)
+                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, glow_color, thickness + radius * 3, cv2.LINE_AA)
             elif "Streaming" in shortcut and self.streaming:
                 # Create animated glow effect for streaming
-                for radius in range(3, 0, -1):
-                    glow_alpha = (0.3 - (radius * 0.1)) * pulse_factor
+                for radius in range(5, 0, -1):  # Increased number of layers
+                    glow_alpha = (0.5 - (radius * 0.1)) * pulse_factor  # Increased base alpha
                     glow_color = (0, 0, int(255 * glow_alpha))
+                    # Draw glow with increasing thickness
                     cv2.putText(canvas, shortcut, (text_x, text_y), 
-                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, glow_color, thickness + radius, cv2.LINE_AA)
+                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, glow_color, thickness + radius * 3, cv2.LINE_AA)
             
             # Draw main text with anti-aliasing
             cv2.putText(canvas, shortcut, (text_x, text_y), 
@@ -1750,9 +1752,10 @@ class WorkshopStream:
                     
                     # Add animated glow effect for recording/streaming
                     if label in ["REC", "LIVE"]:
-                        for radius in range(3, 0, -1):
-                            glow_alpha = (0.3 - (radius * 0.1)) * pulse_factor
+                        for radius in range(5, 0, -1):  # Increased number of layers
+                            glow_alpha = (0.5 - (radius * 0.1)) * pulse_factor  # Increased base alpha
                             glow_color = (0, 0, int(255 * glow_alpha))
+                            # Draw glow with increasing thickness
                             cv2.rectangle(canvas, 
                                         (bg_x - radius, bg_y - radius), 
                                         (bg_x + bg_w + radius, bg_y + bg_h + radius), 
