@@ -49,6 +49,8 @@ class Camera:
     last_frame: Optional[np.ndarray] = None
     input_resolution: Optional[Tuple[int, int]] = None  # Actual input resolution
     aspect_ratio: float = 16/9   # Default aspect ratio
+    frozen_frame: Optional[np.ndarray] = None  # Last frame when connection was lost
+    frozen_frame_time: float = 0  # Time when the frame was frozen
     
     # Frame rate calculation
     _frame_times: list[float] = field(default_factory=list)  # Store last N frame timestamps
@@ -134,6 +136,12 @@ class Camera:
                     
                     # Calculate average bandwidth
                     self._bandwidth = sum(self._bandwidth_samples) / len(self._bandwidth_samples)
+            elif self.connection_lost or current_time - self.last_frame_time > 0.5:
+                # Continue sampling zeros during disconnection or frame drops
+                self._bandwidth_samples.append(0)
+                if len(self._bandwidth_samples) > self._max_bandwidth_samples:
+                    self._bandwidth_samples.pop(0)
+                self._bandwidth = 0
             
             self._last_bandwidth_update = current_time
     
@@ -164,17 +172,22 @@ class Camera:
             polygon_points.append((x + width, y + height))
             polygon_points.append((x, y + height))
             
-            # Fill the area with solid green
-            cv2.fillPoly(frame, [np.array(polygon_points, dtype=np.int32)], (0, 100, 0))
+            # Use red for disconnected state, green for connected
+            color = (0, 0, 255) if self.connection_lost else (0, 100, 0)
+            line_color = (0, 255, 255) if self.connection_lost else (0, 255, 0)
+            
+            # Fill the area
+            cv2.fillPoly(frame, [np.array(polygon_points, dtype=np.int32)], color)
             
             # Draw the top line with anti-aliasing
             for i in range(len(points) - 1):
-                cv2.line(frame, points[i], points[i+1], (0, 255, 0), 1, cv2.LINE_AA)
+                cv2.line(frame, points[i], points[i+1], line_color, 1, cv2.LINE_AA)
     
     def cleanup(self):
         """Clean up resources when camera is no longer needed"""
         self.previous_frame = None
         self._last_frame = None
+        self.frozen_frame = None  # Clear frozen frame
         self._frame_times.clear()  # Clear frame time history
         self._bandwidth_samples.clear()  # Clear bandwidth history
         
@@ -184,11 +197,8 @@ class Camera:
             self.pipeline = None
 
 class ViewMode(Enum):
-    GRID = auto()      # show all cameras in grid
-    ACTIVE = auto()    # show only active cameras
-    OUTPUT = auto()    # show final composite output
-    MOTION = auto()    # show motion detection debug view
-    PIP = auto()       # picture-in-picture mode
+    INPUT = auto()      # show input view in grid
+    OUTPUT = auto()     # output mode
 
 class FramePool:
     """Memory pool for frame buffers to avoid constant allocations"""
@@ -262,7 +272,20 @@ class WorkshopStream:
         self.clean_frame_for_recording: Optional[np.ndarray] = None
         self.running = False
         self.debug = debug
-        self.view_mode = ViewMode.PIP
+        self.view_mode = ViewMode.OUTPUT
+        
+        # Load pin icon
+        try:
+            self.pin_icon = cv2.imread('pin.png', cv2.IMREAD_UNCHANGED)
+            if self.pin_icon is None:
+                log.warning("Failed to load pin.png, falling back to text indicator")
+                self.pin_icon = None
+            else:
+                # Resize pin icon to a reasonable size (e.g., 20x20 pixels)
+                self.pin_icon = cv2.resize(self.pin_icon, (20, 20))
+        except Exception as e:
+            log.warning(f"Error loading pin icon: {e}")
+            self.pin_icon = None
         
         # Recording related attributes
         self.recording = False
@@ -344,11 +367,33 @@ class WorkshopStream:
                 'appsink name=sink emit-signals=True max-buffers=4096 drop=False'
             )
 
-        log.info(f"Creating pipeline for {camera.name}: {pipeline_str}")
+        log.debug(f"Creating pipeline for {camera.name}: {pipeline_str}")
         
         # Create and store the pipeline in the camera object
         camera.pipeline = Gst.parse_launch(pipeline_str)
         camera.sink = camera.pipeline.get_by_name('sink')
+        
+        # Add bus watch to monitor pipeline state changes and errors
+        bus = camera.pipeline.get_bus()
+        bus.add_signal_watch()
+        
+        def on_bus_message(bus, message):
+            t = message.type
+            if t == Gst.MessageType.ERROR:
+                err, debug = message.parse_error()
+                log.error(f"Pipeline error for {camera.name}: {err.message}")
+                log.debug(f"Debug info: {debug}")
+                camera.connection_lost = True
+            elif t == Gst.MessageType.STATE_CHANGED:
+                old_state, new_state, pending_state = message.parse_state_changed()
+                if message.src == camera.pipeline:
+                    log.debug(f"Pipeline state changed for {camera.name}: {old_state.value_nick} -> {new_state.value_nick}")
+            elif t == Gst.MessageType.EOS:
+                log.warning(f"End of stream for {camera.name}")
+                camera.connection_lost = True
+            return True
+            
+        bus.connect('message', on_bus_message)
         
     async def _capture_frames(self, camera: Camera) -> None:
         """Capture frames from a camera and detect people"""
@@ -361,6 +406,11 @@ class WorkshopStream:
 
                 # Create a reference to self that won't prevent garbage collection
                 stream_ref = weakref.ref(self)
+                
+                # Flag to track if we've received the first frame
+                first_frame_received = False
+                connection_start_time = time.time()
+                connection_timeout = 5.0  # 5 seconds timeout for initial connection
 
                 # Setup frame callback
                 def on_new_sample(appsink):
@@ -371,13 +421,7 @@ class WorkshopStream:
                             return Gst.FlowReturn.ERROR
 
                         current_time = time.time()
-                        camera.last_frame_time = current_time
-                        camera.connection_lost = False  # We got a frame, so connection is not lost
-                        camera.retry_count = 0  # Reset retry count on successful frame
                         
-                        # Update frame rate calculation
-                        camera.update_frame_rate(current_time)
-
                         # Get the sample from appsink
                         sample = appsink.emit("pull-sample")
                         if not sample:
@@ -388,26 +432,38 @@ class WorkshopStream:
                         if not buffer:
                             return Gst.FlowReturn.ERROR
 
-                        # Get caps to determine actual resolution
-                        caps = sample.get_caps()
-                        if caps:
-                            structure = caps.get_structure(0)
-                            if structure:
-                                width = structure.get_value('width')
-                                height = structure.get_value('height')
-                                if width and height:
-                                    camera.update_input_resolution(width, height)
-
-                        # Update bandwidth calculation
-                        frame_size = buffer.get_size()
-                        camera.update_bandwidth(frame_size, current_time)
-
                         # Map the buffer for reading
                         success, map_info = buffer.map(Gst.MapFlags.READ)
                         if not success:
                             return Gst.FlowReturn.ERROR
 
                         try:
+                            # Update camera state
+                            camera.last_frame_time = current_time
+                            camera.connection_lost = False  # We got a frame, so connection is not lost
+                            camera.retry_count = 0  # Reset retry count on successful frame
+                            
+                            # Mark that we've received our first frame
+                            nonlocal first_frame_received
+                            first_frame_received = True
+                            
+                            # Update frame rate calculation
+                            camera.update_frame_rate(current_time)
+
+                            # Get caps to determine actual resolution
+                            caps = sample.get_caps()
+                            if caps:
+                                structure = caps.get_structure(0)
+                                if structure:
+                                    width = structure.get_value('width')
+                                    height = structure.get_value('height')
+                                    if width and height:
+                                        camera.update_input_resolution(width, height)
+
+                            # Update bandwidth calculation
+                            frame_size = buffer.get_size()
+                            camera.update_bandwidth(frame_size, current_time)
+
                             # Get a reusable frame from the pool
                             old_frame = camera.last_frame
                             
@@ -435,60 +491,70 @@ class WorkshopStream:
                             detection_counter += 1
                             
                             if detection_counter % 10 == 0:  # Every 10th frame
-                                # Get a frame for detection resizing
-                                small_frame = cv2.resize(camera.last_frame, camera.detection_res)
-                                
-                                # Convert to RGB for MediaPipe
-                                small_frame_rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-                                
-                                # Create MediaPipe image
-                                mp_image = mp.Image(
-                                    image_format=mp.ImageFormat.SRGB,
-                                    data=small_frame_rgb
-                                )
-                                
-                                # Run detection
-                                results = stream.detector.detect(mp_image)
-                                
-                                # Update camera state
-                                camera.face_count = len(results.detections)
-                                if camera.face_count > 0:
-                                    if not camera.active:
-                                        log.info(f"Camera {camera.name} became active")
-                                    camera.active = True
-                                    camera.cooldown = 30
-                                    camera.last_active_time = time.time()
-                                elif camera.cooldown > 0:
-                                    camera.cooldown -= 1
-                                else:
-                                    if camera.active:
-                                        log.info(f"Camera {camera.name} became inactive")
-                                    camera.active = False
-                                    camera.face_count = 0
-                                
-                                # Calculate motion score
-                                # Convert to grayscale for motion detection
-                                gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-                                
-                                if camera.previous_frame is not None:
-                                    # Calculate difference for motion detection
-                                    diff = cv2.absdiff(camera.previous_frame, gray)
-                                    camera.motion_score = np.mean(diff) / 255.0
-                                
-                                # Save current frame for next motion detection
-                                camera.previous_frame = gray
-                                
-                                # Clean up temporary objects
-                                del small_frame
-                                del small_frame_rgb
-                                del mp_image
+                                try:
+                                    # Get a frame for detection resizing
+                                    small_frame = cv2.resize(camera.last_frame, camera.detection_res)
+                                    
+                                    # Convert to RGB for MediaPipe
+                                    small_frame_rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+                                    
+                                    # Create MediaPipe image
+                                    mp_image = mp.Image(
+                                        image_format=mp.ImageFormat.SRGB,
+                                        data=small_frame_rgb
+                                    )
+                                    
+                                    # Run detection
+                                    results = stream.detector.detect(mp_image)
+                                    
+                                    # Update camera state
+                                    camera.face_count = len(results.detections)
+                                    if camera.face_count > 0:
+                                        if not camera.active:
+                                            log.info(f"Camera {camera.name} became active")
+                                        camera.active = True
+                                        camera.cooldown = 30
+                                        camera.last_active_time = time.time()
+                                    elif camera.cooldown > 0:
+                                        camera.cooldown -= 1
+                                    else:
+                                        if camera.active:
+                                            log.info(f"Camera {camera.name} became inactive")
+                                        camera.active = False
+                                        camera.face_count = 0
+                                    
+                                    # Calculate motion score
+                                    # Convert to grayscale for motion detection
+                                    gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+                                    
+                                    if camera.previous_frame is not None:
+                                        # Calculate difference for motion detection
+                                        diff = cv2.absdiff(camera.previous_frame, gray)
+                                        camera.motion_score = np.mean(diff) / 255.0
+                                    
+                                    # Save current frame for next motion detection
+                                    camera.previous_frame = gray
+                                    
+                                except Exception as e:
+                                    log.error(f"Error in detection for {camera.name}: {e}")
+                                    # Don't let detection errors affect the main frame processing
+                                    pass
+                                finally:
+                                    # Clean up temporary objects
+                                    if 'small_frame' in locals():
+                                        del small_frame
+                                    if 'small_frame_rgb' in locals():
+                                        del small_frame_rgb
+                                    if 'mp_image' in locals():
+                                        del mp_image
 
                         finally:
                             # Always unmap the buffer
                             buffer.unmap(map_info)
 
                     except Exception as e:
-                        log.error(f"Error in frame callback: {e}")
+                        log.error(f"Error in frame callback for {camera.name}: {e}")
+                        camera.connection_lost = True
                         return Gst.FlowReturn.ERROR
 
                     return Gst.FlowReturn.OK
@@ -499,30 +565,108 @@ class WorkshopStream:
 
                 log.info(f"Pipeline started for {camera.name}")
 
+                # Wait for first frame or timeout
+                while self.running and not first_frame_received:
+                    if time.time() - connection_start_time > connection_timeout:
+                        log.error(f"Connection timeout for {camera.name} after {connection_timeout} seconds")
+                        camera.connection_lost = True
+                        break
+                    await asyncio.sleep(0.1)
+
+                # If we didn't get a first frame, clean up and retry
+                if not first_frame_received:
+                    self._cleanup_camera(camera)
+                    if camera.retry_count < camera.max_retries:
+                        camera.retry_count += 1
+                        log.info(f"Attempting reconnection to {camera.name} (attempt {camera.retry_count}/{camera.max_retries})")
+                        await asyncio.sleep(camera.retry_interval)
+                        continue
+                    else:
+                        log.error(f"Max retries ({camera.max_retries}) reached for camera {camera.name}")
+                        break
+
                 # Main loop to keep pipeline running and check for connection loss
+                last_metrics_update = time.time()
+                metrics_update_interval = 0.1  # Update metrics every 100ms for smoother graphs
+                last_frame_time = camera.last_frame_time  # Track last actual frame time
+
                 while self.running:
                     current_time = time.time()
                     
-                    # Check for connection loss (no frames for 3 seconds)
-                    if not camera.connection_lost and current_time - camera.last_frame_time > 3:
-                        camera.connection_lost = True
-                        log.warning(f"Connection lost to camera {camera.name}")
+                    # Update metrics more frequently than connection check
+                    if current_time - last_metrics_update >= metrics_update_interval:
+                        # If we haven't received a frame recently, update metrics to show degradation
+                        if current_time - camera.last_frame_time > 0.5:  # 500ms threshold
+                            # Clear frame times if we haven't received a frame in a while
+                            if current_time - last_frame_time > 1.0:  # 1 second threshold
+                                camera._frame_times.clear()
+                                camera.frame_rate = 0.0
+                            
+                            # Update bandwidth to show degradation
+                            camera.update_bandwidth(0, current_time)
+                        else:
+                            # We received a frame recently, update last_frame_time
+                            last_frame_time = camera.last_frame_time
                         
-                        # Clean up the existing pipeline
-                        self._cleanup_camera(camera)
+                        last_metrics_update = current_time
+                    
+                    # Check for connection loss (no frames for 3 seconds)
+                    if current_time - camera.last_frame_time > 3:
+                        if not camera.connection_lost:
+                            try:
+                                camera.connection_lost = True
+                                log.warning(f"Connection lost to camera {camera.name}")
+                                
+                                # Reset camera metrics
+                                camera.active = False
+                                camera.face_count = 0
+                                camera.motion_score = 0
+                                camera.frame_rate = 0
+                                camera._bandwidth = 0
+                                camera._frame_times.clear()  # Clear frame times
+                                
+                                # Store the last frame before cleanup
+                                if camera.last_frame is not None:
+                                    try:
+                                        # Convert to grayscale and blur for the frozen effect
+                                        gray = cv2.cvtColor(camera.last_frame, cv2.COLOR_BGR2GRAY)
+                                        blurred = cv2.GaussianBlur(gray, (15, 15), 20)
+                                        # Convert back to BGR for display
+                                        camera.frozen_frame = cv2.cvtColor(blurred, cv2.COLOR_GRAY2BGR)
+                                        camera.frozen_frame_time = current_time
+                                    except Exception as e:
+                                        log.error(f"Error creating frozen frame for {camera.name}: {e}")
+                                        # If we can't create a frozen frame, just use the last frame
+                                        camera.frozen_frame = camera.last_frame.copy()
+                                        camera.frozen_frame_time = current_time
+                                
+                                # Clean up the existing pipeline
+                                self._cleanup_camera(camera)
+                            except Exception as e:
+                                log.error(f"Error handling connection loss for {camera.name}: {e}")
+                                # Force cleanup even if there was an error
+                                self._cleanup_camera(camera)
                         
                         # Check retry limits
                         if camera.retry_count >= camera.max_retries:
                             log.error(f"Max retries ({camera.max_retries}) reached for camera {camera.name}")
                             break
                         
-                        # Increment retry count and wait before next attempt
-                        camera.retry_count += 1
-                        log.info(f"Attempting reconnection to {camera.name} (attempt {camera.retry_count}/{camera.max_retries})")
-                        await asyncio.sleep(camera.retry_interval)
-                        break  # Break inner loop to recreate pipeline
+                        # Check if it's time to retry
+                        if current_time - camera.frozen_frame_time >= camera.retry_interval:
+                            try:
+                                # Increment retry count
+                                camera.retry_count += 1
+                                log.info(f"Attempting reconnection to {camera.name} (attempt {camera.retry_count}/{camera.max_retries})")
+                                # Break the inner loop to recreate the pipeline
+                                break
+                            except Exception as e:
+                                log.error(f"Error during reconnection attempt for {camera.name}: {e}")
+                                # If we hit an error during reconnection, wait a bit longer
+                                await asyncio.sleep(camera.retry_interval * 2)
+                                break
                     
-                    await asyncio.sleep(0.5)  # Check connection every 0.5 seconds
+                    await asyncio.sleep(0.05)  # Check more frequently for smoother updates
 
             except Exception as e:
                 log.error(f"Error in camera pipeline {camera.name}: {e}")
@@ -542,20 +686,56 @@ class WorkshopStream:
     
     def _cleanup_camera(self, camera: Camera) -> None:
         """Clean up camera resources"""
-        if camera.pipeline:
-            camera.pipeline.set_state(Gst.State.NULL)
-        camera.pipeline = None
-        camera.sink = None
-        
-        # Clear frame references
-        if camera.previous_frame is not None:
-            self.frame_pool.return_frame(camera.previous_frame)
+        try:
+            if camera.pipeline:
+                # Set pipeline to NULL state with timeout
+                ret = camera.pipeline.set_state(Gst.State.NULL)
+                if ret == Gst.StateChangeReturn.ASYNC:
+                    # Wait for state change to complete
+                    ret = camera.pipeline.get_state(timeout=Gst.SECOND)
+                    if ret[0] != Gst.StateChangeReturn.SUCCESS:
+                        log.warning(f"Failed to set pipeline to NULL state for {camera.name}")
+                
+                # Clear references
+                camera.pipeline = None
+                camera.sink = None
+            
+            # Store frozen frame before cleanup if we don't have one
+            if camera.connection_lost and camera.frozen_frame is None and camera.last_frame is not None:
+                try:
+                    # Convert to grayscale and blur for the frozen effect
+                    gray = cv2.cvtColor(camera.last_frame, cv2.COLOR_BGR2GRAY)
+                    blurred = cv2.GaussianBlur(gray, (15, 15), 0)
+                    # Convert back to BGR for display
+                    camera.frozen_frame = cv2.cvtColor(blurred, cv2.COLOR_GRAY2BGR)
+                    camera.frozen_frame_time = time.time()
+                except Exception as e:
+                    log.error(f"Error creating frozen frame for {camera.name}: {e}")
+                    # If we can't create a frozen frame, just use the last frame
+                    camera.frozen_frame = camera.last_frame.copy()
+                    camera.frozen_frame_time = time.time()
+            
+            # Clear frame references
+            if camera.previous_frame is not None:
+                self.frame_pool.return_frame(camera.previous_frame)
+                camera.previous_frame = None
+                
+            if camera.last_frame is not None:
+                self.frame_pool.return_frame(camera.last_frame)
+                camera.last_frame = None
+            
+            # Clear frame times and bandwidth samples
+            camera._frame_times.clear()
+            camera._bandwidth_samples.clear()
+            
+        except Exception as e:
+            log.error(f"Error during camera cleanup for {camera.name}: {e}")
+            # Force clear references even if cleanup fails
+            camera.pipeline = None
+            camera.sink = None
             camera.previous_frame = None
-            
-        if camera.last_frame is not None:
-            self.frame_pool.return_frame(camera.last_frame)
             camera.last_frame = None
-            
+
     def _select_main_camera(self) -> str:
         """Select the best camera to show as main view"""
         # First check for manually selected camera
@@ -861,28 +1041,15 @@ class WorkshopStream:
     
     async def _create_debug_view(self) -> np.ndarray:
         """Create debug view based on current view mode with memory optimizations"""
-        # For PIP mode
-        if self.view_mode == ViewMode.PIP:
-            return await self._create_pip_view()
-        
         # For OUTPUT mode
-        if self.view_mode == ViewMode.OUTPUT and self.output_frame is not None:
-            # Get a frame from the pool for the output with UI elements
-            view = self.frame_pool.get_frame(self.output_frame.shape)
-            np.copyto(view, self.output_frame)
-            
-            # Store reference to output frame for recording (no copy needed)
-            self.clean_frame_for_recording = self.output_frame
-            
-            # Add UI elements to the display view only
-            view = self._add_ui_elements(view)
-            return view
+        if self.view_mode == ViewMode.OUTPUT:
+            return await self._create_output_view()
         
-        # For other view modes (GRID, ACTIVE, MOTION)
-        return await self._create_grid_view()
+        # For INPUT mode
+        return await self._create_input_view()
         
-    async def _create_pip_view(self) -> np.ndarray:
-        """Create picture-in-picture view with memory optimizations"""
+    async def _create_output_view(self) -> np.ndarray:
+        """Create output view with memory optimizations"""
         # Prepare output frames - get from pool
         output = self.frame_pool.get_frame((1080, 1920, 3))
         clean_output = None  # Will be set to original resolution frame
@@ -908,7 +1075,7 @@ class WorkshopStream:
         
         # Get main camera frame
         main_camera = self.cameras[main_camera_name]
-        main_frame = main_camera.last_frame
+        main_frame = main_camera.last_frame if not main_camera.connection_lost else main_camera.frozen_frame
         
         if main_frame is None:
             # Create clean output at 1080p for recording
@@ -938,7 +1105,8 @@ class WorkshopStream:
         
         # Get active cameras excluding main
         active_cameras = [(name, camera) for name, camera in self.cameras.items() 
-                         if name != main_camera_name and camera.active and camera.last_frame is not None]
+                         if name != main_camera_name and (camera.active or camera.connection_lost) and 
+                         (camera.last_frame is not None or camera.frozen_frame is not None)]
         
         # Prepare PiP frame from pool once
         pip_frame = self.frame_pool.get_frame((pip_height, pip_width, 3))
@@ -952,8 +1120,11 @@ class WorkshopStream:
             if y + pip_height > 1080:
                 break
             
+            # Get frame to display (use frozen frame if connection lost)
+            display_frame = camera.frozen_frame if camera.connection_lost else camera.last_frame
+            
             # Scale camera frame to PiP size
-            cv2.resize(camera.last_frame, (pip_width, pip_height), dst=pip_frame)
+            cv2.resize(display_frame, (pip_width, pip_height), dst=pip_frame)
             
             # Insert PiP into output frames with overlay effect
             region = output[y:y+pip_height, x:x+pip_width]
@@ -969,59 +1140,30 @@ class WorkshopStream:
         output = self._add_ui_elements(output)
         return output
         
-    async def _create_grid_view(self) -> np.ndarray:
+    async def _create_input_view(self) -> np.ndarray:
         """Create grid view with memory optimizations"""
         # Collect frames based on view mode
         frames = []
         clean_frames = []
         
         for name, camera in self.cameras.items():
-            # Skip if no frame or inactive cameras in ACTIVE mode
-            if camera.last_frame is None:
+            # Skip if no frame available
+            if camera.last_frame is None and camera.frozen_frame is None:
                 continue
                 
-            if self.view_mode == ViewMode.ACTIVE and not camera.active:
-                continue
+            # Get frame to display (use frozen frame if connection lost)
+            display_frame = camera.frozen_frame if camera.connection_lost else camera.last_frame
+                
+            # Scale frame to 1080p for display
+            display_frame_scaled = self.frame_pool.get_frame((1080, 1920, 3))
+            cv2.resize(display_frame, (1920, 1080), dst=display_frame_scaled)
             
-            # For motion debug view
-            if self.view_mode == ViewMode.MOTION and camera.previous_frame is not None:
-                # Create motion visualization
-                motion_frame = self.frame_pool.get_frame(camera.motion_res)
-                gray_frame = self.frame_pool.get_frame(camera.motion_res, dtype=np.uint8)
-                
-                # Resize and convert to grayscale
-                cv2.resize(camera.last_frame, camera.motion_res, dst=motion_frame)
-                cv2.cvtColor(motion_frame, cv2.COLOR_BGR2GRAY, dst=gray_frame)
-                
-                # Calculate difference
-                diff = cv2.absdiff(camera.previous_frame, gray_frame)
-                
-                # Create color mapped version
-                diff_color = cv2.applyColorMap(diff, cv2.COLORMAP_HOT)
-                
-                # Resize to full resolution
-                display_frame = self.frame_pool.get_frame((1080, 1920, 3))
-                cv2.resize(diff_color, (1920, 1080), dst=display_frame)
-                
-                # Add to frames list
-                frames.append((name, display_frame))
-                clean_frames.append((name, camera.last_frame))  # Use original frame for recording
-                
-                # Return temporary frames to pool
-                self.frame_pool.return_frame(motion_frame)
-                self.frame_pool.return_frame(gray_frame)
-                self.frame_pool.return_frame(diff_color)
-            else:
-                # For normal view, scale frame to 1080p for display
-                display_frame = self.frame_pool.get_frame((1080, 1920, 3))
-                cv2.resize(camera.last_frame, (1920, 1080), dst=display_frame)
-                
-                # Add camera name overlay
-                self._add_camera_overlay(display_frame, camera)
-                
-                # Add to frames list
-                frames.append((name, display_frame))
-                clean_frames.append((name, camera.last_frame))  # Use original frame for recording
+            # Add camera name overlay
+            self._add_camera_overlay(display_frame_scaled, camera)
+            
+            # Add to frames list
+            frames.append((name, display_frame_scaled))
+            clean_frames.append((name, display_frame))  # Use original frame for recording
         
         # If no frames, return blank screen
         if not frames:
@@ -1078,11 +1220,30 @@ class WorkshopStream:
         """Add camera name overlay to frame"""
         # Build the camera name text with status indicators
         text = camera.name
+        
+        # Add selection mode indicator
+        if camera.main_camera:
+            if camera.manual_main:
+                text += " [manual]"
+            else:
+                text += " [auto]"
+            
+        # Add active indicator
         if camera.active:
             text += " [active]"
             
         # Add FPS indicator
         text += f" ({camera.frame_rate:.1f} fps)"
+        
+        # Add motion and face count indicators
+        text += f" [motion: {camera.motion_score:.2f}]"
+        text += f" [faces: {camera.face_count}]"
+        
+        # Add reconnection countdown if connection is lost
+        if camera.connection_lost:
+            time_since_frozen = time.time() - camera.frozen_frame_time
+            retry_in = max(0, camera.retry_interval - time_since_frozen)
+            text += f" [reconnecting in {retry_in:.1f}s]"
             
         text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 1)[0]
         
@@ -1096,10 +1257,43 @@ class WorkshopStream:
         # Draw semi-transparent background
         cv2.rectangle(frame, (bg_x, bg_y), (bg_x + bg_w, bg_y + bg_h), (0, 0, 0), -1)
         
-        # Add camera name text
+        # Add camera name text with color based on connection status and selection mode
+        if camera.connection_lost:
+            text_color = (0, 0, 255)  # Red for disconnected
+        elif camera.manual_main:
+            text_color = (0, 255, 255)  # Yellow for manual selection
+        elif camera.main_camera:
+            text_color = (0, 255, 0)  # Green for auto-selected
+        else:
+            text_color = (255, 255, 255)  # White for normal
+            
+        # Draw the text
         cv2.putText(frame, text, 
                   (bg_x + 10, bg_y + bg_h - 10), 
-                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 1)
+        
+        # Add pin icon if manually selected and we have the icon
+        if camera.manual_main and self.pin_icon is not None:
+            # Calculate position for pin icon (to the left of the text)
+            pin_x = bg_x + 5
+            pin_y = bg_y + (bg_h - self.pin_icon.shape[0]) // 2
+            
+            # Create a region of interest for the pin icon
+            roi = frame[pin_y:pin_y+self.pin_icon.shape[0], pin_x:pin_x+self.pin_icon.shape[1]]
+            
+            # If the pin icon has an alpha channel (4 channels)
+            if self.pin_icon.shape[2] == 4:
+                # Split the pin icon into color and alpha channels
+                pin_bgr = self.pin_icon[:, :, :3]
+                pin_alpha = self.pin_icon[:, :, 3] / 255.0
+                
+                # Blend the pin icon with the background
+                for c in range(3):
+                    roi[:, :, c] = (pin_bgr[:, :, c] * pin_alpha + 
+                                  roi[:, :, c] * (1 - pin_alpha)).astype(np.uint8)
+            else:
+                # If no alpha channel, just copy the icon
+                roi[:] = self.pin_icon
         
         # Add bandwidth graph
         graph_x = bg_x + bg_w + 10  # Place graph to the right of the text
@@ -1120,7 +1314,7 @@ class WorkshopStream:
         # Constants for UI elements (scaled)
         top_bar_height = int(60 * scale_factor)
         bottom_bar_height = int(50 * scale_factor)
-        tab_width = w // 5  # 5 view modes
+        tab_width = w // 2  # 2 view modes
         
         # Create a canvas with extra space for UI
         canvas = self.frame_pool.get_frame((h + top_bar_height + bottom_bar_height, w, 3))
@@ -1135,11 +1329,8 @@ class WorkshopStream:
         
         # Add tabs for each view mode
         view_modes = [
-            (1, "RAW", ViewMode.GRID),
-            (2, "ACTIVE", ViewMode.ACTIVE),
-            (3, "PROCESSED", ViewMode.OUTPUT),
-            (4, "MOTION", ViewMode.MOTION),
-            (5, "PIP", ViewMode.PIP)
+            (1, "RAW INPUT", ViewMode.INPUT),
+            (2, "OUTPUT", ViewMode.OUTPUT)
         ]
         
         for i, (num, name, mode) in enumerate(view_modes):
@@ -1168,11 +1359,12 @@ class WorkshopStream:
         
         # Add keyboard shortcuts to bottom toolbar
         shortcuts = [
-            "1-5: Switch Views",
+            "1-2: Switch Views",
             "A: Auto-Recording",
             "S: Start/Stop Recording",
             "T: Toggle Streaming",
-            "TAB: Cycle Cameras/Auto (PIP)",
+            "M: Remux Last Recording",
+            "TAB: Cycle Cameras/Auto (OUTPUT)",
             "Q: Quit"
         ]
         
@@ -1190,8 +1382,8 @@ class WorkshopStream:
         # Create status indicators if needed
         indicators = []
         
-        # Add main camera name if in PIP mode
-        if self.view_mode == ViewMode.PIP:
+        # Add main camera name if in OUTPUT mode
+        if self.view_mode == ViewMode.OUTPUT:
             main_camera_name = self._select_main_camera()
             if main_camera_name:
                 # Check if we're in auto mode or manual selection
@@ -1312,7 +1504,7 @@ class WorkshopStream:
         log.info("Starting workshop stream")
         self.running = True
         
-        # Create tasks for all cameras
+        # Create tasks for input view
         tasks = [
             asyncio.create_task(self._capture_frames(camera))
             for camera in self.cameras.values()
@@ -1336,6 +1528,13 @@ class WorkshopStream:
         """Run debug viewer with memory management"""
         try:
             while self.running:
+                # Update bandwidth for input view, including disconnected ones
+                current_time = time.time()
+                for camera in self.cameras.values():
+                    if camera.connection_lost:
+                        # Force bandwidth update for disconnected cameras
+                        camera.update_bandwidth(0, current_time)
+                
                 # Create debug view
                 view = await self._create_debug_view()
                 
@@ -1419,17 +1618,11 @@ class WorkshopStream:
         if key == ord('q'):
             raise KeyboardInterrupt
         
-        # Number keys for view modes (1-5)
+        # Number keys for view modes (1-2)
         elif key == ord('1'):
-            self.view_mode = ViewMode.GRID
+            self.view_mode = ViewMode.INPUT
         elif key == ord('2'):
-            self.view_mode = ViewMode.ACTIVE
-        elif key == ord('3'):
             self.view_mode = ViewMode.OUTPUT
-        elif key == ord('4'):
-            self.view_mode = ViewMode.MOTION
-        elif key == ord('5'):
-            self.view_mode = ViewMode.PIP
         
         # Letter shortcuts for other functions
         elif key == ord('a'):  # 'a' to toggle auto-recording
@@ -1442,11 +1635,24 @@ class WorkshopStream:
                 self.stop_recording()
             else:
                 self.start_recording()
-        elif key == ord('\t') and self.view_mode == ViewMode.PIP:
+        elif key == ord('p'):  # 'p' to pause/resume recording
+            if self.recording:
+                if self.recording_paused:
+                    self.resume_recording()
+                else:
+                    self.pause_recording()
+        elif key == ord('\t'):  # TAB to cycle main camera
             self._cycle_main_camera()
+        elif key == ord('r'):  # 'r' to release manual control
+            # Reset all manual selections
+            for cam in self.cameras.values():
+                cam.manual_main = False
+            log.info("Reset to auto camera selection mode")
+        elif key == ord('m'):  # 'm' to remux last recording
+            self._remux_last_recording()
     
     def _cycle_main_camera(self):
-        """Cycle through cameras for PiP mode"""
+        """Cycle through cameras for OUTPUT mode"""
         log.info("TAB pressed. Cycling camera selection.")
         
         # Get list of active cameras
@@ -1493,6 +1699,67 @@ class WorkshopStream:
                     cam.manual_main = False
                 log.info("Reset to auto camera selection mode")
             
+    def _remux_last_recording(self) -> None:
+        """Remux the last recording from MKV to MP4 format"""
+        try:
+            # Get list of MKV files in recordings directory with their modification times
+            mkv_files = []
+            for f in os.listdir('recordings'):
+                if f.endswith('.mkv'):
+                    full_path = os.path.join('recordings', f)
+                    mkv_files.append((full_path, os.path.getmtime(full_path)))
+            
+            if not mkv_files:
+                log.warning("No MKV recordings found to remux")
+                return
+                
+            # Sort by modification time (newest first) and get the most recent file
+            mkv_files.sort(key=lambda x: x[1], reverse=True)
+            last_mkv = mkv_files[0][0]
+            output_mp4 = last_mkv.replace('.mkv', '.mp4')
+            
+            # Skip if MP4 already exists
+            if os.path.exists(output_mp4):
+                log.info(f"MP4 already exists: {output_mp4}")
+                return
+                
+            log.info(f"Remuxing {last_mkv} to {output_mp4}")
+            
+            # Create GStreamer pipeline for remuxing
+            pipeline_str = (
+                f'filesrc location={last_mkv} ! '
+                'matroskademux ! '
+                'h264parse ! '
+                'mp4mux ! '
+                f'filesink location={output_mp4}'
+            )
+            
+            # Create and run pipeline
+            pipeline = Gst.parse_launch(pipeline_str)
+            pipeline.set_state(Gst.State.PLAYING)
+            
+            # Wait for pipeline to finish
+            bus = pipeline.get_bus()
+            msg = bus.timed_pop_filtered(Gst.CLOCK_TIME_NONE, 
+                                       Gst.MessageType.ERROR | Gst.MessageType.EOS)
+            
+            # Clean up
+            pipeline.set_state(Gst.State.NULL)
+            
+            if msg:
+                if msg.type == Gst.MessageType.ERROR:
+                    err, debug = msg.parse_error()
+                    log.error(f"Error during remuxing: {err.message}")
+                    if os.path.exists(output_mp4):
+                        os.remove(output_mp4)  # Clean up failed output
+                else:
+                    log.info(f"Successfully remuxed to {output_mp4}")
+            
+        except Exception as e:
+            log.error(f"Error during remuxing: {e}")
+            if os.path.exists(output_mp4):
+                os.remove(output_mp4)  # Clean up failed output
+
     def stop(self) -> None:
         """Stop the stream processing and clean up resources"""
         self.running = False
@@ -1527,17 +1794,16 @@ if __name__ == "__main__":
     stream.add_camera("rtsp://192.168.1.156:8554/live", "iphone xs")
     stream.add_camera("rtsp://192.168.1.114:8080/h264_pcm.sdp", "galaxy s21")
     
-    print("Debug controls:")
-    print("  1 - grid view (all cameras)")
-    print("  2 - active cameras only")
-    print("  3 - composite output")
-    print("  4 - motion detection debug")
-    print("  5 - picture-in-picture mode")
-    print("  TAB - cycle main camera (in PiP mode)")
-    print("  r - release manual control (in PiP mode)")
+    print("Controls:")
+    print("  1 - input view (all cameras)")
+    print("  2 - output view (for streaming/recording)")
+    print("  TAB - cycle main camera")
+    print("  r - release manual control")
     print("  s - start/stop recording")
+    print("  p - pause/resume recording")
     print("  a - toggle auto-recording")
     print("  t - toggle streaming to Twitch")
+    print("  m - remux last recording")
     print("  q - quit")
     
     # Check if Twitch stream key is available
