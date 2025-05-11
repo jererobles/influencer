@@ -15,6 +15,7 @@ import datetime
 import yaml  # Add import for yaml to load secrets
 import gc  # Explicit garbage collection
 import weakref  # For weak references
+import math  # Add import for math functions
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 log = logging.getLogger(__name__)
@@ -1528,9 +1529,24 @@ class WorkshopStream:
         # Copy frame to middle of canvas
         canvas[top_bar_height:top_bar_height+h] = frame
         
-        # Create top and bottom toolbars (dark gray)
-        canvas[:top_bar_height].fill(40)
-        canvas[top_bar_height+h:].fill(40)
+        # Calculate animation factor for pulsing glow (0.8 to 1.2 range)
+        current_time = time.time()
+        pulse_factor = 1.0 + 0.2 * math.sin(current_time * 2)  # 2 Hz pulse
+        
+        # Create top and bottom toolbars with smooth gradient background
+        for y in range(top_bar_height):
+            # Smooth gradient using cosine interpolation
+            t = y / top_bar_height
+            alpha = 0.7 - 0.2 * (1 - math.cos(t * math.pi)) / 2
+            color = (int(40 * alpha), int(40 * alpha), int(40 * alpha))
+            canvas[y] = color
+            
+        for y in range(bottom_bar_height):
+            # Smooth gradient using cosine interpolation
+            t = y / bottom_bar_height
+            alpha = 0.7 - 0.2 * (1 - math.cos(t * math.pi)) / 2
+            color = (int(40 * alpha), int(40 * alpha), int(40 * alpha))
+            canvas[top_bar_height+h+y] = color
         
         # Add tabs for each view mode
         view_modes = [
@@ -1542,12 +1558,29 @@ class WorkshopStream:
             x_start = i * tab_width
             x_end = (i + 1) * tab_width
             
-            # Highlight active tab
+            # Create semi-transparent background for tab
+            tab_bg = canvas[0:top_bar_height, x_start:x_end].copy()
             if mode == self.view_mode:
-                cv2.rectangle(canvas, (x_start, 0), (x_end, top_bar_height), (0, 120, 255), -1)
+                # Active tab: orange gradient with smooth transition
+                for x in range(x_end - x_start):
+                    t = x / (x_end - x_start)
+                    alpha = 0.8 - 0.2 * (1 - math.cos(t * math.pi)) / 2
+                    color = (int(0 * alpha), int(120 * alpha), int(255 * alpha))
+                    tab_bg[:, x] = color
+            else:
+                # Inactive tab: dark gray gradient with smooth transition
+                for x in range(x_end - x_start):
+                    t = x / (x_end - x_start)
+                    alpha = 0.6 - 0.2 * (1 - math.cos(t * math.pi)) / 2
+                    color = (int(60 * alpha), int(60 * alpha), int(60 * alpha))
+                    tab_bg[:, x] = color
             
-            # Add tab border
-            cv2.rectangle(canvas, (x_start, 0), (x_end, top_bar_height), (100, 100, 100), 1)
+            # Add subtle border with anti-aliasing
+            cv2.rectangle(tab_bg, (0, 0), (x_end-x_start-1, top_bar_height-1), (100, 100, 100), 1, cv2.LINE_AA)
+            
+            # Blend tab background with smooth transition
+            cv2.addWeighted(tab_bg, 0.8, canvas[0:top_bar_height, x_start:x_end], 0.2, 0, 
+                          canvas[0:top_bar_height, x_start:x_end])
             
             # Add tab text with number
             tab_text = f"{num}: {name}"
@@ -1557,12 +1590,17 @@ class WorkshopStream:
             text_x = x_start + (tab_width - text_size[0]) // 2
             text_y = (top_bar_height + text_size[1]) // 2
             
+            # Add text shadow for depth with anti-aliasing
+            shadow_offset = max(1, int(2 * scale_factor))
+            cv2.putText(canvas, tab_text, (text_x+shadow_offset, text_y+shadow_offset), 
+                      cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
+            
             # Use white text for active tab, gray for inactive
             text_color = (255, 255, 255) if mode == self.view_mode else (180, 180, 180)
             cv2.putText(canvas, tab_text, (text_x, text_y), 
-                      cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, thickness)
+                      cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, thickness, cv2.LINE_AA)
         
-        # Add keyboard shortcuts to bottom toolbar
+        # Add keyboard shortcuts to bottom toolbar with enhanced styling
         shortcuts = [
             "A: Auto-Record",
             "S: Recording",
@@ -1582,8 +1620,31 @@ class WorkshopStream:
             text_size = cv2.getTextSize(shortcut, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
             text_x = x_start + (shortcut_width - text_size[0]) // 2
             text_y = top_bar_height + h + (bottom_bar_height + text_size[1]) // 2
+            
+            # Add text shadow with anti-aliasing
+            shadow_offset = max(1, int(scale_factor))
+            cv2.putText(canvas, shortcut, (text_x+shadow_offset, text_y+shadow_offset), 
+                      cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
+            
+            # Add glowing effect for recording/streaming shortcuts with animation
+            if "Recording" in shortcut and self.recording:
+                # Create animated glow effect for recording
+                for radius in range(3, 0, -1):
+                    glow_alpha = (0.3 - (radius * 0.1)) * pulse_factor
+                    glow_color = (0, 0, int(255 * glow_alpha))
+                    cv2.putText(canvas, shortcut, (text_x, text_y), 
+                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, glow_color, thickness + radius, cv2.LINE_AA)
+            elif "Streaming" in shortcut and self.streaming:
+                # Create animated glow effect for streaming
+                for radius in range(3, 0, -1):
+                    glow_alpha = (0.3 - (radius * 0.1)) * pulse_factor
+                    glow_color = (0, 0, int(255 * glow_alpha))
+                    cv2.putText(canvas, shortcut, (text_x, text_y), 
+                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, glow_color, thickness + radius, cv2.LINE_AA)
+            
+            # Draw main text with anti-aliasing
             cv2.putText(canvas, shortcut, (text_x, text_y), 
-                      cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+                      cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
         
         # Create status indicators if needed
         indicators = []
@@ -1601,13 +1662,13 @@ class WorkshopStream:
                     # Show that we're in auto mode
                     indicators.append(("CAMERA", f"{main_camera_name} [auto]", (200, 200, 200), False))
         
-        # Add recording status
+        # Add recording status with enhanced styling
         if self.recording:
             status = "PAUSED" if self.recording_paused else "REC"
             color = (255, 165, 0) if self.recording_paused else (0, 0, 255)  # Orange for paused, red for recording
             indicators.append((status, "", color, True))
         
-        # Add streaming status
+        # Add streaming status with enhanced styling
         if self.streaming:
             indicators.append(("LIVE", "", (0, 0, 255), True))  # Red for live
             
@@ -1631,7 +1692,7 @@ class WorkshopStream:
                 
             indicators.append((auto_rec_text, "", auto_rec_color, True))
         
-        # If we have indicators to show, create a status bar
+        # If we have indicators to show, create a status bar with enhanced styling
         if indicators:
             # Calculate total width needed for the status bar
             total_width = 0
@@ -1648,33 +1709,37 @@ class WorkshopStream:
                     indicator_width += int(20 * scale_factor)  # Extra space for background
                 total_width += indicator_width
             
-            # Create a semi-transparent background for the status bar
+            # Create a semi-transparent background for the status bar with smooth gradient
             status_bar_height = int(40 * scale_factor)
             status_bar_y = top_bar_height + int(10 * scale_factor)
             status_bar_x = w - total_width - padding
             
-            # Draw the rectangle for status bar background
-            cv2.rectangle(canvas, 
-                        (status_bar_x, status_bar_y), 
-                        (w - padding, status_bar_y + status_bar_height), 
-                        (40, 40, 40), -1)
+            # Draw smooth gradient background
+            for x in range(total_width):
+                t = x / total_width
+                alpha = 0.7 - 0.2 * (1 - math.cos(t * math.pi)) / 2
+                color = (int(40 * alpha), int(40 * alpha), int(40 * alpha))
+                cv2.rectangle(canvas, 
+                            (status_bar_x + x, status_bar_y), 
+                            (status_bar_x + x + 1, status_bar_y + status_bar_height), 
+                            color, -1)
             
-            # Draw a subtle border around the status bar
+            # Draw a subtle border around the status bar with anti-aliasing
             cv2.rectangle(canvas, 
                         (status_bar_x, status_bar_y), 
                         (w - padding, status_bar_y + status_bar_height), 
-                        (100, 100, 100), 1)
+                        (100, 100, 100), 1, cv2.LINE_AA)
             
             # Start position for the leftmost indicator
             x_pos = status_bar_x + padding
             y_pos = status_bar_y + status_bar_height//2 + int(5 * scale_factor)  # Adjust for text baseline
             
-            # Draw indicators from left to right
+            # Draw indicators from left to right with enhanced styling
             for label, value, color, has_bg in indicators:
                 display_text = f"{label}" if not value else f"{label}: {value}"
                 text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
                 
-                # For status indicators (REC, LIVE, PAUSED), add a colored background
+                # For status indicators (REC, LIVE, PAUSED), add a colored background with animated glow
                 if has_bg:
                     # Calculate background rectangle dimensions
                     bg_padding = int(10 * scale_factor)
@@ -1683,22 +1748,40 @@ class WorkshopStream:
                     bg_w = text_size[0] + bg_padding * 2
                     bg_h = status_bar_height - int(10 * scale_factor)
                     
-                    # Draw colored background
+                    # Add animated glow effect for recording/streaming
+                    if label in ["REC", "LIVE"]:
+                        for radius in range(3, 0, -1):
+                            glow_alpha = (0.3 - (radius * 0.1)) * pulse_factor
+                            glow_color = (0, 0, int(255 * glow_alpha))
+                            cv2.rectangle(canvas, 
+                                        (bg_x - radius, bg_y - radius), 
+                                        (bg_x + bg_w + radius, bg_y + bg_h + radius), 
+                                        glow_color, -1)
+                    
+                    # Draw colored background with anti-aliasing
                     cv2.rectangle(canvas, 
                                 (bg_x, bg_y), 
                                 (bg_x + bg_w, bg_y + bg_h), 
-                                color, -1)
+                                color, -1, cv2.LINE_AA)
                     
-                    # Draw text in white on colored background
+                    # Add text shadow with anti-aliasing
+                    shadow_offset = max(1, int(scale_factor))
+                    cv2.putText(canvas, display_text, (x_pos+shadow_offset, y_pos+shadow_offset), 
+                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
+                    
+                    # Draw text in white on colored background with anti-aliasing
                     cv2.putText(canvas, display_text, (x_pos, y_pos), 
-                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
                     
                     # Move right for next indicator with padding
                     x_pos += bg_w + padding
                 else:
-                    # Draw regular text for camera name
+                    # Draw regular text for camera name with shadow and anti-aliasing
+                    shadow_offset = max(1, int(scale_factor))
+                    cv2.putText(canvas, display_text, (x_pos+shadow_offset, y_pos+shadow_offset), 
+                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
                     cv2.putText(canvas, display_text, (x_pos, y_pos), 
-                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
+                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
                     
                     # Move right for next indicator with padding
                     x_pos += text_size[0] + padding
