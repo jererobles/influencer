@@ -1616,33 +1616,60 @@ class WorkshopStream:
         for i, shortcut in enumerate(shortcuts):
             x_start = i * shortcut_width
             font_scale = 0.7 * scale_factor
-            thickness = max(1, int(scale_factor))
+            thickness = max(2, int(2 * scale_factor))  # Increased base thickness
             text_size = cv2.getTextSize(shortcut, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
             text_x = x_start + (shortcut_width - text_size[0]) // 2
             text_y = top_bar_height + h + (bottom_bar_height + text_size[1]) // 2
             
+            # Add glowing background for recording/streaming shortcuts
+            if "Recording" in shortcut and self.recording:
+                # Create animated glow effect for recording background
+                for radius in range(5, 0, -1):
+                    glow_alpha = (0.5 - (radius * 0.1)) * pulse_factor
+                    glow_color = (0, 0, int(255 * glow_alpha))
+                    # Draw glowing background with increasing size
+                    bg_x = text_x - int(10 * scale_factor)
+                    bg_y = text_y - text_size[1] - int(5 * scale_factor)
+                    bg_w = text_size[0] + int(20 * scale_factor)
+                    bg_h = text_size[1] + int(10 * scale_factor)
+                    cv2.rectangle(canvas, 
+                                (bg_x - radius, bg_y - radius), 
+                                (bg_x + bg_w + radius, bg_y + bg_h + radius), 
+                                glow_color, -1)
+            elif "Streaming" in shortcut and self.streaming:
+                # Create animated glow effect for streaming background
+                for radius in range(5, 0, -1):
+                    glow_alpha = (0.5 - (radius * 0.1)) * pulse_factor
+                    glow_color = (0, 0, int(255 * glow_alpha))
+                    # Draw glowing background with increasing size
+                    bg_x = text_x - int(10 * scale_factor)
+                    bg_y = text_y - text_size[1] - int(5 * scale_factor)
+                    bg_w = text_size[0] + int(20 * scale_factor)
+                    bg_h = text_size[1] + int(10 * scale_factor)
+                    cv2.rectangle(canvas, 
+                                (bg_x - radius, bg_y - radius), 
+                                (bg_x + bg_w + radius, bg_y + bg_h + radius), 
+                                glow_color, -1)
+            elif "Auto-Record" in shortcut and self.auto_recording:
+                # Create animated glow effect for auto-record background
+                for radius in range(5, 0, -1):
+                    glow_alpha = (0.5 - (radius * 0.1)) * pulse_factor
+                    # Use green glow for auto-record
+                    glow_color = (0, int(200 * glow_alpha), 0)
+                    # Draw glowing background with increasing size
+                    bg_x = text_x - int(10 * scale_factor)
+                    bg_y = text_y - text_size[1] - int(5 * scale_factor)
+                    bg_w = text_size[0] + int(20 * scale_factor)
+                    bg_h = text_size[1] + int(10 * scale_factor)
+                    cv2.rectangle(canvas, 
+                                (bg_x - radius, bg_y - radius), 
+                                (bg_x + bg_w + radius, bg_y + bg_h + radius), 
+                                glow_color, -1)
+            
             # Add text shadow with anti-aliasing
             shadow_offset = max(1, int(scale_factor))
             cv2.putText(canvas, shortcut, (text_x+shadow_offset, text_y+shadow_offset), 
-                      cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
-            
-            # Add glowing effect for recording/streaming shortcuts with animation
-            if "Recording" in shortcut and self.recording:
-                # Create animated glow effect for recording
-                for radius in range(5, 0, -1):  # Increased number of layers
-                    glow_alpha = (0.5 - (radius * 0.1)) * pulse_factor  # Increased base alpha
-                    glow_color = (0, 0, int(255 * glow_alpha))
-                    # Draw glow with increasing thickness
-                    cv2.putText(canvas, shortcut, (text_x, text_y), 
-                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, glow_color, thickness + radius * 3, cv2.LINE_AA)
-            elif "Streaming" in shortcut and self.streaming:
-                # Create animated glow effect for streaming
-                for radius in range(5, 0, -1):  # Increased number of layers
-                    glow_alpha = (0.5 - (radius * 0.1)) * pulse_factor  # Increased base alpha
-                    glow_color = (0, 0, int(255 * glow_alpha))
-                    # Draw glow with increasing thickness
-                    cv2.putText(canvas, shortcut, (text_x, text_y), 
-                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, glow_color, thickness + radius * 3, cv2.LINE_AA)
+                      cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 1, cv2.LINE_AA)
             
             # Draw main text with anti-aliasing
             cv2.putText(canvas, shortcut, (text_x, text_y), 
@@ -1681,15 +1708,15 @@ class WorkshopStream:
             
             if self.recording and not self.recording_paused and any_active:
                 # Auto-recording is actively recording
-                auto_rec_text = "AUTO-REC: ACTIVE"
+                auto_rec_text = "AUTO-REC"
                 auto_rec_color = (50, 200, 50)  # Green
             elif self.recording and self.recording_paused and not any_active:
                 # Auto-recording is paused due to no activity
-                auto_rec_text = "AUTO-REC: PAUSED"
+                auto_rec_text = "AUTO-REC"
                 auto_rec_color = (200, 200, 50)  # Yellow
             else:
                 # Auto-recording is enabled but not currently recording
-                auto_rec_text = "AUTO-REC: READY"
+                auto_rec_text = "AUTO-REC"
                 auto_rec_color = (100, 150, 100)  # Light green
                 
             indicators.append((auto_rec_text, "", auto_rec_color, True))
@@ -1700,94 +1727,134 @@ class WorkshopStream:
             total_width = 0
             padding = int(15 * scale_factor)  # Padding between indicators
             
+            # First calculate width for camera name
+            camera_width = 0
             for label, value, _, has_bg in indicators:
+                if label == "CAMERA":
+                    display_text = f"{label}: {value}"
+                    font_scale = 0.8 * scale_factor
+                    thickness = max(1, int(2 * scale_factor))
+                    text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
+                    camera_width = text_size[0] + padding
+            
+            # Calculate total width needed for other indicators
+            other_indicators = [(label, value) for label, value, _, has_bg in indicators if label != "CAMERA"]
+            other_width = 0
+            indicator_widths = []  # Store widths for each indicator
+            
+            for label, value in other_indicators:
                 display_text = f"{label}" if not value else f"{label}: {value}"
                 font_scale = 0.8 * scale_factor
                 thickness = max(1, int(2 * scale_factor))
                 text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
-                # Width for text + spacing + background if needed
-                indicator_width = text_size[0] + padding
-                if has_bg:
-                    indicator_width += int(20 * scale_factor)  # Extra space for background
-                total_width += indicator_width
+                # Add extra padding for icon and background
+                indicator_width = text_size[0] + int(40 * scale_factor)
+                indicator_widths.append(indicator_width)
+                other_width += indicator_width + padding
             
-            # Create a semi-transparent background for the status bar with smooth gradient
+            # Create a semi-transparent background for the status bar
             status_bar_height = int(40 * scale_factor)
             status_bar_y = top_bar_height + int(10 * scale_factor)
-            status_bar_x = w - total_width - padding
             
-            # Draw smooth gradient background
-            for x in range(total_width):
-                t = x / total_width
-                alpha = 0.7 - 0.2 * (1 - math.cos(t * math.pi)) / 2
-                color = (int(40 * alpha), int(40 * alpha), int(40 * alpha))
+            # Draw camera name indicator on the left if present
+            if camera_width > 0:
+                camera_x = padding
+                # Draw gradient background for camera name
+                for x in range(camera_width):
+                    t = x / camera_width
+                    alpha = 0.7 - 0.2 * (1 - math.cos(t * math.pi)) / 2
+                    color = (int(40 * alpha), int(40 * alpha), int(40 * alpha))
+                    cv2.rectangle(canvas, 
+                                (camera_x + x, status_bar_y), 
+                                (camera_x + x + 1, status_bar_y + status_bar_height), 
+                                color, -1)
+                
+                # Draw border around camera name
                 cv2.rectangle(canvas, 
-                            (status_bar_x + x, status_bar_y), 
-                            (status_bar_x + x + 1, status_bar_y + status_bar_height), 
-                            color, -1)
+                            (camera_x, status_bar_y), 
+                            (camera_x + camera_width, status_bar_y + status_bar_height), 
+                            (100, 100, 100), 1, cv2.LINE_AA)
+
+                # Draw camera name
+                y_pos = status_bar_y + status_bar_height//2 + int(5 * scale_factor)
+                for label, value, color, has_bg in indicators:
+                    if label == "CAMERA":
+                        display_text = f"{label}: {value}"
+                        font_scale = 0.8 * scale_factor
+                        thickness = max(1, int(2 * scale_factor))
+                        
+                        # Draw text with shadow
+                        shadow_offset = max(1, int(scale_factor))
+                        cv2.putText(canvas, display_text, (camera_x+shadow_offset, y_pos+shadow_offset), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
+                        cv2.putText(canvas, display_text, (camera_x, y_pos), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
             
-            # Draw a subtle border around the status bar with anti-aliasing
-            cv2.rectangle(canvas, 
-                        (status_bar_x, status_bar_y), 
-                        (w - padding, status_bar_y + status_bar_height), 
-                        (100, 100, 100), 1, cv2.LINE_AA)
+            # Draw other indicators right-aligned
+            y_pos = status_bar_y + status_bar_height//2 + int(5 * scale_factor)
+            x_pos = w - padding  # Start from right edge
             
-            # Start position for the leftmost indicator
-            x_pos = status_bar_x + padding
-            y_pos = status_bar_y + status_bar_height//2 + int(5 * scale_factor)  # Adjust for text baseline
+            # Reverse indicators to draw right-to-left
+            other_indicators = [(label, value, color, has_bg) for label, value, color, has_bg in reversed(indicators) if label != "CAMERA"]
             
-            # Draw indicators from left to right with enhanced styling
-            for label, value, color, has_bg in indicators:
+            for i, (label, value, color, has_bg) in enumerate(other_indicators):
                 display_text = f"{label}" if not value else f"{label}: {value}"
+                font_scale = 0.8 * scale_factor
+                thickness = max(1, int(2 * scale_factor))
                 text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
                 
-                # For status indicators (REC, LIVE, PAUSED), add a colored background with animated glow
+                # Calculate position for this indicator
+                indicator_width = indicator_widths[-(i+1)]
+                x_pos -= indicator_width
+                
+                # Draw indicator background
                 if has_bg:
-                    # Calculate background rectangle dimensions
                     bg_padding = int(10 * scale_factor)
-                    bg_x = x_pos - bg_padding
-                    bg_y = status_bar_y + int(5 * scale_factor)
-                    bg_w = text_size[0] + bg_padding * 2
-                    bg_h = status_bar_height - int(10 * scale_factor)
+                    cv2.rectangle(canvas,
+                                (x_pos - bg_padding, status_bar_y),
+                                (x_pos + indicator_width + bg_padding, status_bar_y + status_bar_height),
+                                (40, 40, 40), -1)
                     
-                    # Add animated glow effect for recording/streaming
+                    # Draw icon based on indicator type
+                    icon_x = x_pos + int(10 * scale_factor)
+                    icon_y = y_pos - int(text_size[1] * 0.5)
+                    
                     if label in ["REC", "LIVE"]:
-                        for radius in range(5, 0, -1):  # Increased number of layers
-                            glow_alpha = (0.5 - (radius * 0.1)) * pulse_factor  # Increased base alpha
-                            glow_color = (0, 0, int(255 * glow_alpha))
-                            # Draw glow with increasing thickness
-                            cv2.rectangle(canvas, 
-                                        (bg_x - radius, bg_y - radius), 
-                                        (bg_x + bg_w + radius, bg_y + bg_h + radius), 
-                                        glow_color, -1)
-                    
-                    # Draw colored background with anti-aliasing
-                    cv2.rectangle(canvas, 
-                                (bg_x, bg_y), 
-                                (bg_x + bg_w, bg_y + bg_h), 
-                                color, -1, cv2.LINE_AA)
-                    
-                    # Add text shadow with anti-aliasing
-                    shadow_offset = max(1, int(scale_factor))
-                    cv2.putText(canvas, display_text, (x_pos+shadow_offset, y_pos+shadow_offset), 
-                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
-                    
-                    # Draw text in white on colored background with anti-aliasing
-                    cv2.putText(canvas, display_text, (x_pos, y_pos), 
-                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-                    
-                    # Move right for next indicator with padding
-                    x_pos += bg_w + padding
-                else:
-                    # Draw regular text for camera name with shadow and anti-aliasing
-                    shadow_offset = max(1, int(scale_factor))
-                    cv2.putText(canvas, display_text, (x_pos+shadow_offset, y_pos+shadow_offset), 
-                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
-                    cv2.putText(canvas, display_text, (x_pos, y_pos), 
-                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
-                    
-                    # Move right for next indicator with padding
-                    x_pos += text_size[0] + padding
+                        circle_radius = int(text_size[1] * 0.5)
+                        cv2.circle(canvas, (icon_x, icon_y), circle_radius, (0, 0, 255), -1)
+                    elif label == "PAUSED":
+                        bar_width = int(text_size[1] * 0.3)
+                        bar_height = int(text_size[1] * 0.8)
+                        gap = int(text_size[1] * 0.15)
+                        cv2.rectangle(canvas, 
+                                    (icon_x - bar_width - gap, icon_y - bar_height//2),
+                                    (icon_x - gap, icon_y + bar_height//2),
+                                    (255, 165, 0), -1)
+                        cv2.rectangle(canvas,
+                                    (icon_x + gap, icon_y - bar_height//2),
+                                    (icon_x + bar_width + gap, icon_y + bar_height//2),
+                                    (255, 165, 0), -1)
+                    elif label == "AUTO-REC":
+                        radius = int(text_size[1] * 0.4)
+                        cv2.circle(canvas, (icon_x, icon_y), radius, color, 2)
+                        arrow_length = radius // 2
+                        arrow_angle = math.pi / 4
+                        start_x = icon_x + int(radius * math.cos(arrow_angle))
+                        start_y = icon_y + int(radius * math.sin(arrow_angle))
+                        end_x = icon_x + int((radius + arrow_length) * math.cos(arrow_angle))
+                        end_y = icon_y + int((radius + arrow_length) * math.sin(arrow_angle))
+                        cv2.arrowedLine(canvas, (start_x, start_y), (end_x, end_y), color, 2, tipLength=0.3)
+                
+                # Draw text with shadow
+                text_x = x_pos + int(30 * scale_factor)  # Add space for icon
+                shadow_offset = max(1, int(scale_factor))
+                cv2.putText(canvas, display_text, (text_x+shadow_offset, y_pos+shadow_offset),
+                          cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
+                cv2.putText(canvas, display_text, (text_x, y_pos),
+                          cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+                
+                # Add padding between indicators
+                x_pos -= padding
         
         return canvas
 
@@ -1923,11 +1990,19 @@ class WorkshopStream:
         elif key == ord('t'):  # 't' to toggle streaming
             self.toggle_streaming()
         elif key == ord('s'):  # 's' to start/stop recording
+            # Turn off auto-record when manually controlling recording
+            if self.auto_recording:
+                self.auto_recording = False
+                log.info("Auto-recording disabled due to manual recording control")
             if self.recording:
                 self.stop_recording()
             else:
                 self.start_recording()
         elif key == ord('p'):  # 'p' to pause/resume recording
+            # Turn off auto-record when manually controlling recording
+            if self.auto_recording:
+                self.auto_recording = False
+                log.info("Auto-recording disabled due to manual recording control")
             if self.recording:
                 if self.recording_paused:
                     self.resume_recording()
