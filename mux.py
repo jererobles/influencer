@@ -1409,9 +1409,7 @@ class WorkshopStream:
             retry_state = self.retry_manager.get_retry_state(camera.name)
             if retry_state['retry_count'] < self.retry_manager.max_retries:
                 time_until_retry = int(max(0, retry_state['next_retry_time'] - time.time()))
-                status_text = f"WAITING {time_until_retry}s..."
-            else:
-                status_text = "DISCONNECTED"
+                status_text = f"ATTEMPT {retry_state['retry_count']+1}/{self.retry_manager.max_retries}   WAITING {time_until_retry}s..."
         
         # Metrics
         fps = int(camera.frame_rate)
@@ -1468,12 +1466,13 @@ class WorkshopStream:
 
         # Draw status text if disconnected
         if status_text:
-            status_x = text_x + name_size[0] + box_padding_h
-            status_y = text_y
+            status_x = (frame.shape[1] - status_size[0]) // 2  # Center horizontally
+            status_y = (frame.shape[0] - status_size[1]) // 2  # Center vertically
             # Use red for disconnected, yellow for reconnecting
-            status_color = (0, 0, 255) if "DISCONNECTED" in status_text else (0, 255, 255)
+            cv2.putText(frame, "DISCONNECTED", (status_x+1, status_y-(status_size[1]*2)+1), font, font_scale*0.8, (0,0,0), font_thickness+2, line_type)
+            cv2.putText(frame, "DISCONNECTED", (status_x, status_y-(status_size[1]*2)), font, font_scale*0.8, (0, 0, 255), font_thickness, line_type)
             cv2.putText(frame, status_text, (status_x+1, status_y+1), font, font_scale*0.8, (0,0,0), font_thickness+2, line_type)
-            cv2.putText(frame, status_text, (status_x, status_y), font, font_scale*0.8, status_color, font_thickness, line_type)
+            cv2.putText(frame, status_text, (status_x, status_y), font, font_scale*0.8, (0, 255, 255), font_thickness, line_type)
 
         # Draw metrics line with 5px gap
         metrics_x = text_x
@@ -1565,12 +1564,13 @@ class WorkshopStream:
         
         # Add keyboard shortcuts to bottom toolbar
         shortcuts = [
-            "1-2: Switch Views",
-            "A: Auto-Recording",
-            "S: Start/Stop Recording",
-            "T: Toggle Streaming",
-            "M: Remux Last Recording",
-            "TAB: Cycle Cameras/Auto (OUTPUT)",
+            "A: Auto-Record",
+            "S: Recording",
+            "P: Pause",
+            "T: Streaming",
+            "R: Remux Last File",
+            "TAB: Next Camera",
+            "L: Lock In",
             "Q: Quit"
         ]
         
@@ -1851,7 +1851,7 @@ class WorkshopStream:
             self._toggle_lock_current_camera()
         elif key == ord('\t'):  # TAB to cycle main camera
             self._cycle_main_camera()
-        elif key == ord('m'):  # 'm' to remux last recording
+        elif key == ord('r'):  # 'r' to remux last recording
             self._remux_last_recording()
     
     def _toggle_lock_current_camera(self):
@@ -1879,6 +1879,9 @@ class WorkshopStream:
     def _cycle_main_camera(self):
         """Cycle through cameras for OUTPUT mode"""
         log.info("TAB pressed. Cycling camera selection.")
+        
+        # Reset the cooldown timer for auto-switching
+        self.last_tab_time = time.time()
         
         # Get list of active cameras (excluding offline ones)
         active_cameras = [name for name, cam in self.cameras.items() 
@@ -2005,13 +2008,13 @@ if __name__ == "__main__":
     print("Controls:")
     print("  1 - input view (all cameras)")
     print("  2 - output view (for streaming/recording)")
-    print("  TAB - cycle main camera")
-    print("  r - release manual control")
+    print("  TAB - next camera")
+    print("  l - lock in current camera")
     print("  s - start/stop recording")
     print("  p - pause/resume recording")
-    print("  a - toggle auto-recording")
-    print("  t - toggle streaming to Twitch")
-    print("  m - remux last recording")
+    print("  a - auto-recording")
+    print("  t - Twitch streaming")
+    print("  r - remux last recording")
     print("  q - quit")
     
     # Check if Twitch stream key is available
