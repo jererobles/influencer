@@ -270,18 +270,23 @@ class Camera:
     def handle_connection_loss(self, current_time: float) -> None:
         """Handle connection loss and setup retry timing"""
         if not self.connection_lost:
-            self.connection_lost = True
-            # Don't reset retry count here, only increment
-            self.retry_count += 1
-            self.next_retry_time = current_time + self.get_retry_interval()
-            
-            # Reset camera metrics
+            # Immediately mark as inactive and lost connection
             self.active = False
+            self.connection_lost = True
             self.face_count = 0
             self.motion_score = 0
             self.frame_rate = 0
             self._bandwidth = 0
             self._frame_times.clear()
+            
+            # Don't reset retry count here, only increment
+            self.retry_count += 1
+            self.next_retry_time = current_time + self.get_retry_interval()
+            
+            # If this was the main camera, remove that status
+            if self.main_camera:
+                self.main_camera = False
+                self.manual_main = False  # Also remove manual lock
             
             # Store frozen frame if we have a last frame
             if self.last_frame is not None:
@@ -735,7 +740,13 @@ class WorkshopStream:
                     if current_time - camera.last_frame_time > 3:
                         if not camera.connection_lost:
                             try:
+                                # Immediately mark as inactive and lost connection
+                                camera.active = False
                                 camera.connection_lost = True
+                                camera.face_count = 0
+                                camera.motion_score = 0
+                                camera.frame_rate = 0
+                                
                                 self.retry_manager.handle_connection_loss(camera.name, current_time)
                                 log.warning(f"Connection lost to camera {camera.name}")
                                 
@@ -744,7 +755,11 @@ class WorkshopStream:
                                     camera.main_camera = False
                                     camera.manual_main = False  # Also remove manual lock
                                     # Select a new main camera
-                                    self._select_main_camera()
+                                    new_main = self._select_main_camera()
+                                    if new_main:
+                                        log.info(f"Switched main camera to {new_main} after {camera.name} lost connection")
+                                    else:
+                                        log.warning("No active cameras available to switch to")
                                 
                                 # Clean up the existing pipeline
                                 self._cleanup_camera(camera)
@@ -862,7 +877,7 @@ class WorkshopStream:
         """Select the best camera to show as main view"""
         # First check for manually selected camera
         manual_main = next((name for name, camera in self.cameras.items() 
-                           if camera.manual_main), None)
+                           if camera.manual_main and not camera.connection_lost), None)
         if manual_main:
             # Reset all main_camera flags
             for camera in self.cameras.values():
@@ -876,7 +891,7 @@ class WorkshopStream:
         if current_time - self.last_tab_time < self.tab_cooldown:
             # Return current main camera if cooldown hasn't elapsed
             current_main = next((name for name, cam in self.cameras.items() 
-                               if cam.main_camera), None)
+                               if cam.main_camera and not cam.connection_lost), None)
             if current_main:
                 return current_main
 
@@ -887,7 +902,8 @@ class WorkshopStream:
         best_score = -1
 
         for name, camera in self.cameras.items():
-            if not camera.active:
+            # Skip inactive or disconnected cameras
+            if not camera.active or camera.connection_lost:
                 continue
 
             # Calculate a score based on multiple factors
@@ -914,6 +930,7 @@ class WorkshopStream:
         # Set main_camera flag for the best camera
         if best_camera:
             self.cameras[best_camera].main_camera = True
+            log.info(f"Selected {best_camera} as main camera with score {best_score}")
 
         return best_camera
 
@@ -1252,7 +1269,7 @@ class WorkshopStream:
         
         # Get active cameras excluding main
         active_cameras = [(name, camera) for name, camera in self.cameras.items() 
-                         if name != main_camera_name and (camera.active or camera.connection_lost) and 
+                         if name != main_camera_name and camera.active and not camera.connection_lost and 
                          (camera.last_frame is not None or camera.frozen_frame is not None)]
         
         # Prepare PiP frame from pool once
@@ -1423,7 +1440,7 @@ class WorkshopStream:
             metrics_size[0] + box_padding_w*2   # Metrics + padding
         )
         box_padding_h = 15
-        total_height = name_size[1] + status_size[1] + metrics_size[1] + (box_padding_h * 2)  # Text heights + padding
+        total_height = name_size[1] + metrics_size[1] + (box_padding_h * 2)  # Text heights + padding
 
         # Calculate position for the background box
         box_margin = 10
@@ -1460,7 +1477,7 @@ class WorkshopStream:
 
         # Draw metrics line with 5px gap
         metrics_x = text_x
-        metrics_y = text_y + status_size[1] + metrics_size[1] + 15
+        metrics_y = text_y + metrics_size[1] + 15
         cv2.putText(frame, metrics, (metrics_x+1, metrics_y+1), font, font_scale*0.8, (0,0,0), font_thickness+2, line_type)
         cv2.putText(frame, metrics, (metrics_x, metrics_y), font, font_scale*0.8, (200,200,200), font_thickness, line_type)
 
@@ -1863,8 +1880,9 @@ class WorkshopStream:
         """Cycle through cameras for OUTPUT mode"""
         log.info("TAB pressed. Cycling camera selection.")
         
-        # Get list of active cameras
-        active_cameras = [name for name, cam in self.cameras.items() if cam.active]
+        # Get list of active cameras (excluding offline ones)
+        active_cameras = [name for name, cam in self.cameras.items() 
+                         if cam.active and not cam.connection_lost]
         
         if not active_cameras:
             return
