@@ -22,6 +22,73 @@ log = logging.getLogger(__name__)
 # Initialize GStreamer once
 Gst.init(None)
 
+class RetryManager:
+    """Manages connection retry state for cameras"""
+    def __init__(self, max_retries: int = 10, base_retry_interval: float = 1.0, max_retry_interval: float = 30.0):
+        self.max_retries = max_retries
+        self.base_retry_interval = base_retry_interval
+        self.max_retry_interval = max_retry_interval
+        self.retry_states: Dict[str, Dict] = {}  # camera_name -> retry state
+    
+    def get_retry_state(self, camera_name: str) -> Dict:
+        """Get or create retry state for a camera"""
+        if camera_name not in self.retry_states:
+            self.retry_states[camera_name] = {
+                'retry_count': 0,
+                'next_retry_time': 0,
+                'connection_lost': False,
+                'last_retry_time': 0  # Track when we last attempted a retry
+            }
+        return self.retry_states[camera_name]
+    
+    def handle_connection_loss(self, camera_name: str, current_time: float) -> None:
+        """Handle connection loss and setup retry timing"""
+        state = self.get_retry_state(camera_name)
+        if not state['connection_lost']:
+            state['connection_lost'] = True
+            state['retry_count'] += 1
+            state['next_retry_time'] = current_time + self.get_retry_interval(state['retry_count'])
+            state['last_retry_time'] = current_time
+            log.debug(f"Connection loss for {camera_name}, retry count: {state['retry_count']}")
+    
+    def should_retry(self, camera_name: str, current_time: float) -> bool:
+        """Check if it's time to retry connection"""
+        state = self.get_retry_state(camera_name)
+        return (state['connection_lost'] and 
+                state['retry_count'] < self.max_retries and 
+                current_time >= state['next_retry_time'])
+    
+    def prepare_next_retry(self, camera_name: str, current_time: float) -> None:
+        """Prepare for the next retry attempt"""
+        state = self.get_retry_state(camera_name)
+        # Only increment retry count if this is a new retry attempt
+        if current_time - state['last_retry_time'] > self.base_retry_interval:
+            state['retry_count'] += 1
+            state['last_retry_time'] = current_time
+        state['next_retry_time'] = current_time + self.get_retry_interval(state['retry_count'])
+        retry_interval = self.get_retry_interval(state['retry_count'])
+        log.info(f"Attempting reconnection to {camera_name} (attempt {state['retry_count']}/{self.max_retries}, next retry in {retry_interval:.1f}s)")
+    
+    def get_retry_interval(self, retry_count: int) -> float:
+        """Calculate retry interval using exponential backoff"""
+        interval = self.base_retry_interval * (2 ** retry_count)
+        return min(interval, self.max_retry_interval)
+    
+    def reset_retry_state(self, camera_name: str) -> None:
+        """Reset retry state for a camera after successful connection"""
+        state = self.get_retry_state(camera_name)
+        state['retry_count'] = 0
+        state['connection_lost'] = False
+        state['next_retry_time'] = 0
+        state['last_retry_time'] = 0
+        log.debug(f"Reset retry state for {camera_name}")
+    
+    def cleanup(self, camera_name: str) -> None:
+        """Clean up retry state for a camera"""
+        if camera_name in self.retry_states:
+            del self.retry_states[camera_name]
+            log.debug(f"Cleaned up retry state for {camera_name}")
+
 @dataclass
 class Camera:
     url: str
@@ -42,9 +109,6 @@ class Camera:
     sink: Optional[Gst.Element] = None
     last_frame_time: float = 0   # timestamp of last received frame
     connection_lost: bool = False  # flag for connection status
-    retry_count: int = 0         # count of reconnection attempts
-    max_retries: int = 10        # maximum number of reconnection attempts
-    retry_interval: float = 5.0  # seconds between retry attempts
     frame_rate: float = 30.0     # calculated frame rate
     last_frame: Optional[np.ndarray] = None
     input_resolution: Optional[Tuple[int, int]] = None  # Actual input resolution
@@ -196,6 +260,53 @@ class Camera:
             self.sink = None
             self.pipeline = None
 
+    def get_retry_interval(self) -> float:
+        """Calculate retry interval using exponential backoff"""
+        # Start with base interval and double with each retry
+        interval = self.base_retry_interval * (2 ** self.retry_count)
+        # Cap at max_retry_interval
+        return min(interval, self.max_retry_interval)
+
+    def handle_connection_loss(self, current_time: float) -> None:
+        """Handle connection loss and setup retry timing"""
+        if not self.connection_lost:
+            self.connection_lost = True
+            # Don't reset retry count here, only increment
+            self.retry_count += 1
+            self.next_retry_time = current_time + self.get_retry_interval()
+            
+            # Reset camera metrics
+            self.active = False
+            self.face_count = 0
+            self.motion_score = 0
+            self.frame_rate = 0
+            self._bandwidth = 0
+            self._frame_times.clear()
+            
+            # Store frozen frame if we have a last frame
+            if self.last_frame is not None:
+                try:
+                    gray = cv2.cvtColor(self.last_frame, cv2.COLOR_BGR2GRAY)
+                    blurred = cv2.GaussianBlur(gray, (15, 15), 20)
+                    self.frozen_frame = cv2.cvtColor(blurred, cv2.COLOR_GRAY2BGR)
+                    self.frozen_frame_time = current_time
+                except Exception as e:
+                    log.error(f"Error creating frozen frame for {self.name}: {e}")
+                    self.frozen_frame = self.last_frame.copy()
+                    self.frozen_frame_time = current_time
+
+    def should_retry(self, current_time: float) -> bool:
+        """Check if it's time to retry connection"""
+        return (self.connection_lost and 
+                self.retry_count < self.max_retries and 
+                current_time >= self.next_retry_time)
+
+    def prepare_next_retry(self, current_time: float) -> None:
+        """Prepare for the next retry attempt"""
+        self.next_retry_time = current_time + self.get_retry_interval()
+        retry_interval = self.get_retry_interval()
+        log.info(f"Attempting reconnection to {self.name} (attempt {self.retry_count}/{self.max_retries}, next retry in {retry_interval:.1f}s)")
+
 class ViewMode(Enum):
     INPUT = auto()      # show input view in grid
     OUTPUT = auto()     # output mode
@@ -274,19 +385,6 @@ class WorkshopStream:
         self.debug = debug
         self.view_mode = ViewMode.OUTPUT
         
-        # Load pin icon
-        try:
-            self.pin_icon = cv2.imread('pin.png', cv2.IMREAD_UNCHANGED)
-            if self.pin_icon is None:
-                log.warning("Failed to load pin.png, falling back to text indicator")
-                self.pin_icon = None
-            else:
-                # Resize pin icon to a reasonable size (e.g., 20x20 pixels)
-                self.pin_icon = cv2.resize(self.pin_icon, (20, 20))
-        except Exception as e:
-            log.warning(f"Error loading pin icon: {e}")
-            self.pin_icon = None
-        
         # Recording related attributes
         self.recording = False
         self.recording_pipeline = None
@@ -306,11 +404,19 @@ class WorkshopStream:
         # Load secrets
         self.twitch_stream_key = self._load_twitch_stream_key()
         
+        # Initialize retry manager
+        self.retry_manager = RetryManager()
+        
         # Initialize mediapipe detector
         BaseOptions = mp.tasks.BaseOptions
         Detector = mp.tasks.vision.ObjectDetector
         DetectorOptions = mp.tasks.vision.ObjectDetectorOptions
         VisionRunningMode = mp.tasks.vision.RunningMode
+
+        # Load lock icon for overlays
+        self.pushpin_icon = cv2.imread('icons8-lock-30.png', cv2.IMREAD_UNCHANGED)
+        if self.pushpin_icon is None:
+            log.warning('Could not load lock.png for overlays.')
 
         # Create detector for person detection
         options = DetectorOptions(
@@ -320,10 +426,16 @@ class WorkshopStream:
             category_allowlist=['person'])
         self.detector = Detector.create_from_options(options)
         
+        # Add timestamp for last tab press
+        self.last_tab_time = 0
+        self.tab_cooldown = 5.0  # 5 seconds cooldown
+        
     def add_camera(self, url: str, name: str) -> None:
         """Add a new camera to the stream"""
         camera = Camera(url=url, name=name)
         self.cameras[name] = camera
+        # Initialize retry state for the new camera
+        self.retry_manager.get_retry_state(name)
         log.info(f"Added camera: {name} @ {url}")
         
     def _load_twitch_stream_key(self) -> str:
@@ -440,8 +552,10 @@ class WorkshopStream:
                         try:
                             # Update camera state
                             camera.last_frame_time = current_time
+                            if camera.connection_lost:
+                                # Reset retry state when we get a frame after being disconnected
+                                stream.retry_manager.reset_retry_state(camera.name)
                             camera.connection_lost = False  # We got a frame, so connection is not lost
-                            camera.retry_count = 0  # Reset retry count on successful frame
                             
                             # Mark that we've received our first frame
                             nonlocal first_frame_received
@@ -555,6 +669,7 @@ class WorkshopStream:
                     except Exception as e:
                         log.error(f"Error in frame callback for {camera.name}: {e}")
                         camera.connection_lost = True
+                        self.retry_manager.handle_connection_loss(camera.name, time.time())
                         return Gst.FlowReturn.ERROR
 
                     return Gst.FlowReturn.OK
@@ -570,19 +685,25 @@ class WorkshopStream:
                     if time.time() - connection_start_time > connection_timeout:
                         log.error(f"Connection timeout for {camera.name} after {connection_timeout} seconds")
                         camera.connection_lost = True
+                        self.retry_manager.handle_connection_loss(camera.name, time.time())
                         break
                     await asyncio.sleep(0.1)
 
                 # If we didn't get a first frame, clean up and retry
                 if not first_frame_received:
                     self._cleanup_camera(camera)
-                    if camera.retry_count < camera.max_retries:
-                        camera.retry_count += 1
-                        log.info(f"Attempting reconnection to {camera.name} (attempt {camera.retry_count}/{camera.max_retries})")
-                        await asyncio.sleep(camera.retry_interval)
+                    retry_state = self.retry_manager.get_retry_state(camera.name)
+                    if retry_state['retry_count'] < self.retry_manager.max_retries:
+                        self.retry_manager.prepare_next_retry(camera.name, time.time())
+                        await asyncio.sleep(self.retry_manager.get_retry_interval(retry_state['retry_count']))
                         continue
                     else:
-                        log.error(f"Max retries ({camera.max_retries}) reached for camera {camera.name}")
+                        log.error(f"Max retries ({self.retry_manager.max_retries}) reached for camera {camera.name}")
+                        # Remove the camera from the system
+                        camera_name = camera.name
+                        del self.cameras[camera_name]
+                        self.retry_manager.cleanup(camera_name)
+                        log.info(f"Removed camera {camera_name} after max retries")
                         break
 
                 # Main loop to keep pipeline running and check for connection loss
@@ -615,30 +736,15 @@ class WorkshopStream:
                         if not camera.connection_lost:
                             try:
                                 camera.connection_lost = True
+                                self.retry_manager.handle_connection_loss(camera.name, current_time)
                                 log.warning(f"Connection lost to camera {camera.name}")
                                 
-                                # Reset camera metrics
-                                camera.active = False
-                                camera.face_count = 0
-                                camera.motion_score = 0
-                                camera.frame_rate = 0
-                                camera._bandwidth = 0
-                                camera._frame_times.clear()  # Clear frame times
-                                
-                                # Store the last frame before cleanup
-                                if camera.last_frame is not None:
-                                    try:
-                                        # Convert to grayscale and blur for the frozen effect
-                                        gray = cv2.cvtColor(camera.last_frame, cv2.COLOR_BGR2GRAY)
-                                        blurred = cv2.GaussianBlur(gray, (15, 15), 20)
-                                        # Convert back to BGR for display
-                                        camera.frozen_frame = cv2.cvtColor(blurred, cv2.COLOR_GRAY2BGR)
-                                        camera.frozen_frame_time = current_time
-                                    except Exception as e:
-                                        log.error(f"Error creating frozen frame for {camera.name}: {e}")
-                                        # If we can't create a frozen frame, just use the last frame
-                                        camera.frozen_frame = camera.last_frame.copy()
-                                        camera.frozen_frame_time = current_time
+                                # If this was the main camera, select another one
+                                if camera.main_camera:
+                                    camera.main_camera = False
+                                    camera.manual_main = False  # Also remove manual lock
+                                    # Select a new main camera
+                                    self._select_main_camera()
                                 
                                 # Clean up the existing pipeline
                                 self._cleanup_camera(camera)
@@ -648,22 +754,28 @@ class WorkshopStream:
                                 self._cleanup_camera(camera)
                         
                         # Check retry limits
-                        if camera.retry_count >= camera.max_retries:
-                            log.error(f"Max retries ({camera.max_retries}) reached for camera {camera.name}")
+                        retry_state = self.retry_manager.get_retry_state(camera.name)
+                        if retry_state['retry_count'] >= self.retry_manager.max_retries:
+                            log.error(f"Max retries ({self.retry_manager.max_retries}) reached for camera {camera.name}")
+                            # Remove the camera from the system
+                            camera_name = camera.name
+                            self._cleanup_camera(camera)
+                            del self.cameras[camera_name]
+                            self.retry_manager.cleanup(camera_name)
+                            log.info(f"Removed camera {camera_name} after max retries")
                             break
                         
                         # Check if it's time to retry
-                        if current_time - camera.frozen_frame_time >= camera.retry_interval:
+                        if self.retry_manager.should_retry(camera.name, current_time):
                             try:
-                                # Increment retry count
-                                camera.retry_count += 1
-                                log.info(f"Attempting reconnection to {camera.name} (attempt {camera.retry_count}/{camera.max_retries})")
+                                self.retry_manager.prepare_next_retry(camera.name, current_time)
                                 # Break the inner loop to recreate the pipeline
                                 break
                             except Exception as e:
                                 log.error(f"Error during reconnection attempt for {camera.name}: {e}")
                                 # If we hit an error during reconnection, wait a bit longer
-                                await asyncio.sleep(camera.retry_interval * 2)
+                                await asyncio.sleep(self.retry_manager.get_retry_interval(
+                                    self.retry_manager.get_retry_state(camera.name)['retry_count']) * 2)
                                 break
                     
                     await asyncio.sleep(0.05)  # Check more frequently for smoother updates
@@ -673,20 +785,42 @@ class WorkshopStream:
                 self._cleanup_camera(camera)
                 
                 # Handle retries
-                if camera.retry_count < camera.max_retries:
-                    camera.retry_count += 1
-                    log.info(f"Attempting reconnection to {camera.name} (attempt {camera.retry_count}/{camera.max_retries})")
-                    await asyncio.sleep(camera.retry_interval)
+                retry_state = self.retry_manager.get_retry_state(camera.name)
+                if retry_state['retry_count'] < self.retry_manager.max_retries:
+                    self.retry_manager.prepare_next_retry(camera.name, time.time())
+                    await asyncio.sleep(self.retry_manager.get_retry_interval(retry_state['retry_count']))
                 else:
-                    log.error(f"Max retries ({camera.max_retries}) reached for camera {camera.name}")
+                    log.error(f"Max retries ({self.retry_manager.max_retries}) reached for camera {camera.name}")
+                    # Remove the camera from the system
+                    camera_name = camera.name
+                    del self.cameras[camera_name]
+                    self.retry_manager.cleanup(camera_name)
+                    log.info(f"Removed camera {camera_name} after max retries")
                     break
 
         # Final cleanup
         self._cleanup_camera(camera)
+        self.retry_manager.cleanup(camera.name)
     
     def _cleanup_camera(self, camera: Camera) -> None:
         """Clean up camera resources"""
         try:
+            # Store frozen frame before cleanup if we have a last frame
+            if camera.connection_lost and camera.last_frame is not None:
+                try:
+                    # Convert to grayscale and blur for the frozen effect
+                    gray = cv2.cvtColor(camera.last_frame, cv2.COLOR_BGR2GRAY)
+                    blurred = cv2.GaussianBlur(gray, (15, 15), 0)
+                    # Convert back to BGR for display
+                    camera.frozen_frame = cv2.cvtColor(blurred, cv2.COLOR_GRAY2BGR)
+                    camera.frozen_frame_time = time.time()
+                    log.debug(f"Updated frozen frame for {camera.name}")
+                except Exception as e:
+                    log.error(f"Error creating frozen frame for {camera.name}: {e}")
+                    # If we can't create a frozen frame, just use the last frame
+                    camera.frozen_frame = camera.last_frame.copy()
+                    camera.frozen_frame_time = time.time()
+            
             if camera.pipeline:
                 # Set pipeline to NULL state with timeout
                 ret = camera.pipeline.set_state(Gst.State.NULL)
@@ -700,21 +834,6 @@ class WorkshopStream:
                 camera.pipeline = None
                 camera.sink = None
             
-            # Store frozen frame before cleanup if we don't have one
-            if camera.connection_lost and camera.frozen_frame is None and camera.last_frame is not None:
-                try:
-                    # Convert to grayscale and blur for the frozen effect
-                    gray = cv2.cvtColor(camera.last_frame, cv2.COLOR_BGR2GRAY)
-                    blurred = cv2.GaussianBlur(gray, (15, 15), 0)
-                    # Convert back to BGR for display
-                    camera.frozen_frame = cv2.cvtColor(blurred, cv2.COLOR_GRAY2BGR)
-                    camera.frozen_frame_time = time.time()
-                except Exception as e:
-                    log.error(f"Error creating frozen frame for {camera.name}: {e}")
-                    # If we can't create a frozen frame, just use the last frame
-                    camera.frozen_frame = camera.last_frame.copy()
-                    camera.frozen_frame_time = time.time()
-            
             # Clear frame references
             if camera.previous_frame is not None:
                 self.frame_pool.return_frame(camera.previous_frame)
@@ -724,9 +843,12 @@ class WorkshopStream:
                 self.frame_pool.return_frame(camera.last_frame)
                 camera.last_frame = None
             
-            # Clear frame times and bandwidth samples
-            camera._frame_times.clear()
-            camera._bandwidth_samples.clear()
+            # Only clear frame times and bandwidth samples if we're removing the camera
+            # (i.e., not just handling a connection loss)
+            retry_state = self.retry_manager.get_retry_state(camera.name)
+            if retry_state['retry_count'] >= self.retry_manager.max_retries:
+                camera._frame_times.clear()
+                camera._bandwidth_samples.clear()
             
         except Exception as e:
             log.error(f"Error during camera cleanup for {camera.name}: {e}")
@@ -742,7 +864,24 @@ class WorkshopStream:
         manual_main = next((name for name, camera in self.cameras.items() 
                            if camera.manual_main), None)
         if manual_main:
+            # Reset all main_camera flags
+            for camera in self.cameras.values():
+                camera.main_camera = False
+            # Set main_camera flag for manually selected camera
+            self.cameras[manual_main].main_camera = True
             return manual_main
+
+        # If no manual selection, check cooldown for auto-switching
+        current_time = time.time()
+        if current_time - self.last_tab_time < self.tab_cooldown:
+            # Return current main camera if cooldown hasn't elapsed
+            current_main = next((name for name, cam in self.cameras.items() 
+                               if cam.main_camera), None)
+            if current_main:
+                return current_main
+
+        # Update last tab time for next auto-switch
+        self.last_tab_time = current_time
 
         best_camera = None
         best_score = -1
@@ -767,6 +906,14 @@ class WorkshopStream:
             if score > best_score:
                 best_score = score
                 best_camera = name
+
+        # Reset all main_camera flags
+        for camera in self.cameras.values():
+            camera.main_camera = False
+            
+        # Set main_camera flag for the best camera
+        if best_camera:
+            self.cameras[best_camera].main_camera = True
 
         return best_camera
 
@@ -1138,6 +1285,7 @@ class WorkshopStream:
         
         # Add UI elements to display view
         output = self._add_ui_elements(output)
+        
         return output
         
     async def _create_input_view(self) -> np.ndarray:
@@ -1201,6 +1349,16 @@ class WorkshopStream:
             # For clean output, resize original frame to cell size
             cv2.resize(clean_frame, (cell_w, cell_h), dst=cell_frame)
             clean_output[y:y+cell_h, x:x+cell_w] = cell_frame
+            
+            # Draw thick border if this is the main camera, accounting for the top bar
+            if self.cameras[name].main_camera:
+                line_width = 4
+                cv2.rectangle(
+                    output,
+                    (x + line_width-1, y + line_width-1),
+                    (x + cell_w - line_width+1, y + cell_h - line_width+1),
+                    (0, 255, 255), line_width
+                )
         
         # Return cell frame to pool
         self.frame_pool.return_frame(cell_frame)
@@ -1214,93 +1372,124 @@ class WorkshopStream:
         
         # Add UI elements
         output = self._add_ui_elements(output)
+        
         return output
     
     def _add_camera_overlay(self, frame: np.ndarray, camera: Camera) -> None:
-        """Add camera name overlay to frame"""
-        # Build the camera name text with status indicators
-        text = camera.name
+        """Add camera name overlay to frame, with improved legibility and new metrics layout"""
+        # Set font parameters for better visibility
+        font_scale = 1.1  # Larger font
+        font_thickness = 2  # Thicker text
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        line_type = cv2.LINE_AA  # Antialiased
+
+        # Camera name (simulate bold by drawing twice)
+        name_text = camera.name
         
-        # Add selection mode indicator
-        if camera.main_camera:
-            if camera.manual_main:
-                text += " [manual]"
+        # Add connection status if disconnected
+        status_text = ""
+        if camera.connection_lost:
+            retry_state = self.retry_manager.get_retry_state(camera.name)
+            if retry_state['retry_count'] < self.retry_manager.max_retries:
+                time_until_retry = int(max(0, retry_state['next_retry_time'] - time.time()))
+                status_text = f"WAITING {time_until_retry}s..."
             else:
-                text += " [auto]"
-            
-        # Add active indicator
-        if camera.active:
-            text += " [active]"
-            
-        # Add FPS indicator
-        text += f" ({camera.frame_rate:.1f} fps)"
+                status_text = "DISCONNECTED"
         
-        # Add motion and face count indicators
-        text += f" [motion: {camera.motion_score:.2f}]"
-        text += f" [faces: {camera.face_count}]"
+        # Metrics
+        fps = int(camera.frame_rate)
+        motion = f"Motion: {camera.motion_score:.2f}"
+        faces = f"Faces: {camera.face_count}"
+        status = "active" if camera.active else "standby"
+        metrics = f"{status.upper()} | FPS: {fps} | {motion} | {faces}"
+
+        # Calculate text sizes
+        name_size = cv2.getTextSize(name_text, font, font_scale, font_thickness)[0]
+        status_size = cv2.getTextSize(status_text, font, font_scale * 0.8, font_thickness)[0] if status_text else (0, 0)
+        metrics_size = cv2.getTextSize(metrics, font, font_scale * 0.8, font_thickness)[0]
+
+        # Icon size
+        icon_width = 0
+        icon_height = 0
+        if self.pushpin_icon is not None:
+            icon_width = self.pushpin_icon.shape[1]
+            icon_height = self.pushpin_icon.shape[0]
+
+        # Calculate total width needed for the background box
+        box_padding_w = 10
+        total_width = max(
+            name_size[0] + icon_width + box_padding_w*2,  # Name + icon + padding
+            status_size[0] + box_padding_w*2,  # Status + padding
+            metrics_size[0] + box_padding_w*2   # Metrics + padding
+        )
+        box_padding_h = 15
+        total_height = name_size[1] + status_size[1] + metrics_size[1] + (box_padding_h * 2)  # Text heights + padding
+
+        # Calculate position for the background box
+        box_margin = 10
+        box_x = box_margin
+        box_y = box_margin
+
+        # Draw semi-transparent background box
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (box_x, box_y), (box_x + total_width, box_y + total_height), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+        # Draw camera name with icon
+        text_x = box_x + box_padding_w
+        text_y = box_y + name_size[1] + 5
+
+        # Draw name text (simulate bold)
+        cv2.putText(frame, name_text, (text_x+1, text_y+1), font, font_scale, (0,0,0), font_thickness+2, line_type)
+        cv2.putText(frame, name_text, (text_x, text_y), font, font_scale, (255,255,255), font_thickness, line_type)
+
+        # Add lock icon if camera is manually selected
+        if camera.manual_main and self.pushpin_icon is not None:
+            icon_x = text_x + name_size[0] + 5
+            icon_y = text_y - icon_height
+            self._overlay_image_with_alpha(frame, self.pushpin_icon, icon_x, icon_y)
+
+        # Draw status text if disconnected
+        if status_text:
+            status_x = text_x + name_size[0] + box_padding_h
+            status_y = text_y
+            # Use red for disconnected, yellow for reconnecting
+            status_color = (0, 0, 255) if "DISCONNECTED" in status_text else (0, 255, 255)
+            cv2.putText(frame, status_text, (status_x+1, status_y+1), font, font_scale*0.8, (0,0,0), font_thickness+2, line_type)
+            cv2.putText(frame, status_text, (status_x, status_y), font, font_scale*0.8, status_color, font_thickness, line_type)
+
+        # Draw metrics line with 5px gap
+        metrics_x = text_x
+        metrics_y = text_y + status_size[1] + metrics_size[1] + 15
+        cv2.putText(frame, metrics, (metrics_x+1, metrics_y+1), font, font_scale*0.8, (0,0,0), font_thickness+2, line_type)
+        cv2.putText(frame, metrics, (metrics_x, metrics_y), font, font_scale*0.8, (200,200,200), font_thickness, line_type)
+
+        # Bandwidth graph: make it the same size as the metrics container
+        graph_x = box_x + total_width + box_margin
+        graph_y = box_y
+        graph_w = 150
+        graph_h = total_height
+        camera.draw_bandwidth_graph(frame, graph_x, graph_y, graph_w, graph_h)
         
-        # Add reconnection countdown if connection is lost
-        if camera.connection_lost:
-            time_since_frozen = time.time() - camera.frozen_frame_time
-            retry_in = max(0, camera.retry_interval - time_since_frozen)
-            text += f" [reconnecting in {retry_in:.1f}s]"
-            
-        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 1)[0]
         
-        # Draw a semi-transparent background rectangle
-        h, w = frame.shape[:2]
-        bg_x = 10
-        bg_y = h - 10 - text_size[1] - 10  # 10px padding
-        bg_w = text_size[0] + 20  # 10px padding on each side
-        bg_h = text_size[1] + 10  # 5px padding on top and bottom
         
-        # Draw semi-transparent background
-        cv2.rectangle(frame, (bg_x, bg_y), (bg_x + bg_w, bg_y + bg_h), (0, 0, 0), -1)
         
-        # Add camera name text with color based on connection status and selection mode
-        if camera.connection_lost:
-            text_color = (0, 0, 255)  # Red for disconnected
-        elif camera.manual_main:
-            text_color = (0, 255, 255)  # Yellow for manual selection
-        elif camera.main_camera:
-            text_color = (0, 255, 0)  # Green for auto-selected
+        
+        
+        
+    
+    def _overlay_image_with_alpha(self, background, overlay, x, y):
+        """Overlay an RGBA image on a BGR background at (x, y)"""
+        h, w = overlay.shape[:2]
+        if overlay.shape[2] == 4:  # Has alpha channel
+            alpha = overlay[:, :, 3] / 255.0
+            for c in range(3):
+                background[y:y+h, x:x+w, c] = (
+                    alpha * overlay[:, :, c] +
+                    (1 - alpha) * background[y:y+h, x:x+w, c]
+                )
         else:
-            text_color = (255, 255, 255)  # White for normal
-            
-        # Draw the text
-        cv2.putText(frame, text, 
-                  (bg_x + 10, bg_y + bg_h - 10), 
-                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 1)
-        
-        # Add pin icon if manually selected and we have the icon
-        if camera.manual_main and self.pin_icon is not None:
-            # Calculate position for pin icon (to the left of the text)
-            pin_x = bg_x + 5
-            pin_y = bg_y + (bg_h - self.pin_icon.shape[0]) // 2
-            
-            # Create a region of interest for the pin icon
-            roi = frame[pin_y:pin_y+self.pin_icon.shape[0], pin_x:pin_x+self.pin_icon.shape[1]]
-            
-            # If the pin icon has an alpha channel (4 channels)
-            if self.pin_icon.shape[2] == 4:
-                # Split the pin icon into color and alpha channels
-                pin_bgr = self.pin_icon[:, :, :3]
-                pin_alpha = self.pin_icon[:, :, 3] / 255.0
-                
-                # Blend the pin icon with the background
-                for c in range(3):
-                    roi[:, :, c] = (pin_bgr[:, :, c] * pin_alpha + 
-                                  roi[:, :, c] * (1 - pin_alpha)).astype(np.uint8)
-            else:
-                # If no alpha channel, just copy the icon
-                roi[:] = self.pin_icon
-        
-        # Add bandwidth graph
-        graph_x = bg_x + bg_w + 10  # Place graph to the right of the text
-        graph_y = bg_y
-        graph_width = 120  # Width of the graph
-        graph_height = 40  # Height of the graph
-        camera.draw_bandwidth_graph(frame, graph_x, graph_y, graph_width, graph_height)
+            background[y:y+h, x:x+w] = overlay
     
     def _add_ui_elements(self, frame: np.ndarray) -> np.ndarray:
         """Add UI elements with resolution-independent scaling"""
@@ -1641,15 +1830,34 @@ class WorkshopStream:
                     self.resume_recording()
                 else:
                     self.pause_recording()
+        elif key == ord('l'):  # 'l' to lock/unlock current camera
+            self._toggle_lock_current_camera()
         elif key == ord('\t'):  # TAB to cycle main camera
             self._cycle_main_camera()
-        elif key == ord('r'):  # 'r' to release manual control
-            # Reset all manual selections
-            for cam in self.cameras.values():
-                cam.manual_main = False
-            log.info("Reset to auto camera selection mode")
         elif key == ord('m'):  # 'm' to remux last recording
             self._remux_last_recording()
+    
+    def _toggle_lock_current_camera(self):
+        """Lock or unlock the current main camera"""
+        # Get current main camera
+        main_camera_name = self._select_main_camera()
+        if not main_camera_name:
+            return
+            
+        # Get the camera
+        camera = self.cameras[main_camera_name]
+        
+        # Toggle lock state
+        camera.manual_main = not camera.manual_main
+        
+        # If we're locking this camera, unlock all others
+        if camera.manual_main:
+            for other_camera in self.cameras.values():
+                if other_camera != camera:
+                    other_camera.manual_main = False
+            log.info(f"Locked on camera: {main_camera_name}")
+        else:
+            log.info(f"Unlocked camera: {main_camera_name}")
     
     def _cycle_main_camera(self):
         """Cycle through cameras for OUTPUT mode"""
@@ -1660,45 +1868,27 @@ class WorkshopStream:
         
         if not active_cameras:
             return
-            
-        # Check if we're currently in auto mode (no manual selection)
-        any_manual = any(cam.manual_main for cam in self.cameras.values())
         
-        # If in auto mode, select the first camera
-        if not any_manual:
-            # Select the first active camera
-            first_camera = self.cameras[active_cameras[0]]
-            first_camera.manual_main = True
-            log.info(f"Switching from auto mode to manual camera: {active_cameras[0]}")
+        # Find current main camera
+        current_main = next((name for name, cam in self.cameras.items() 
+                           if cam.main_camera), None)
+        
+        if current_main in active_cameras:
+            # Find next camera in cycle
+            current_idx = active_cameras.index(current_main)
+            next_idx = (current_idx + 1) % len(active_cameras)
+            next_camera = active_cameras[next_idx]
+            
+            # Update main camera flags
+            self.cameras[current_main].main_camera = False
+            self.cameras[next_camera].main_camera = True
+            log.info(f"Switched main camera to: {next_camera}")
         else:
-            # Find the current manually selected camera
-            current_manual = next((name for name, cam in self.cameras.items() 
-                                if cam.manual_main), None)
-            
-            if current_manual in active_cameras:
-                # Find the next camera in the cycle
-                current_idx = active_cameras.index(current_manual)
-                next_idx = (current_idx + 1) % (len(active_cameras) + 1)  # +1 for auto mode
-                
-                # Reset all manual selections
-                for cam in self.cameras.values():
-                    cam.manual_main = False
-                
-                # If next_idx is within active_cameras, select that camera
-                # Otherwise, it means we've cycled back to auto mode
-                if next_idx < len(active_cameras):
-                    next_camera = self.cameras[active_cameras[next_idx]]
-                    next_camera.manual_main = True
-                    log.info(f"Manually selected camera: {active_cameras[next_idx]}")
-                else:
-                    # Auto mode - no manual selection
-                    log.info("Switched to auto camera selection mode")
-            else:
-                # Current manual camera is not active, reset to auto mode
-                for cam in self.cameras.values():
-                    cam.manual_main = False
-                log.info("Reset to auto camera selection mode")
-            
+            # If no main camera or current main is not active, select first active camera
+            first_camera = active_cameras[0]
+            self.cameras[first_camera].main_camera = True
+            log.info(f"Selected first active camera: {first_camera}")
+    
     def _remux_last_recording(self) -> None:
         """Remux the last recording from MKV to MP4 format"""
         try:
