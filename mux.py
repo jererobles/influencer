@@ -26,7 +26,7 @@ Gst.init(None)
 class Camera:
     url: str
     name: str
-    resolution: Tuple[int, int] = (1920, 1080)
+    resolution: Tuple[int, int] = (1920, 1080)  # Target resolution
     motion_res: Tuple[int, int] = (256, 256)
     detection_res: Tuple[int, int] = (256, 256)
     motion_threshold: float = 0.1
@@ -47,6 +47,8 @@ class Camera:
     retry_interval: float = 5.0  # seconds between retry attempts
     frame_rate: float = 30.0     # calculated frame rate
     last_frame: Optional[np.ndarray] = None
+    input_resolution: Optional[Tuple[int, int]] = None  # Actual input resolution
+    aspect_ratio: float = 16/9   # Default aspect ratio
     
     # Frame rate calculation
     _frame_times: list[float] = field(default_factory=list)  # Store last N frame timestamps
@@ -64,6 +66,20 @@ class Camera:
     
     # Memory management
     _last_frame: Optional[np.ndarray] = None
+    
+    def update_input_resolution(self, width: int, height: int) -> None:
+        """Update the input resolution and calculate aspect ratio"""
+        self.input_resolution = (width, height)
+        self.aspect_ratio = width / height
+        
+    def get_scaled_resolution(self, target_width: int) -> Tuple[int, int]:
+        """Calculate scaled resolution maintaining aspect ratio"""
+        if not self.input_resolution:
+            return (target_width, int(target_width / self.aspect_ratio))
+            
+        # Calculate height based on aspect ratio
+        target_height = int(target_width / self.aspect_ratio)
+        return (target_width, target_height)
     
     @property
     def last_frame(self) -> Optional[np.ndarray]:
@@ -372,6 +388,16 @@ class WorkshopStream:
                         if not buffer:
                             return Gst.FlowReturn.ERROR
 
+                        # Get caps to determine actual resolution
+                        caps = sample.get_caps()
+                        if caps:
+                            structure = caps.get_structure(0)
+                            if structure:
+                                width = structure.get_value('width')
+                                height = structure.get_value('height')
+                                if width and height:
+                                    camera.update_input_resolution(width, height)
+
                         # Update bandwidth calculation
                         frame_size = buffer.get_size()
                         camera.update_bandwidth(frame_size, current_time)
@@ -384,11 +410,21 @@ class WorkshopStream:
                         try:
                             # Get a reusable frame from the pool
                             old_frame = camera.last_frame
-                            camera.last_frame = np.ndarray(
-                                shape=(camera.resolution[1], camera.resolution[0], 3),
-                                dtype=np.uint8,
-                                buffer=map_info.data
-                            )
+                            
+                            # Create frame with actual input resolution
+                            if camera.input_resolution:
+                                camera.last_frame = np.ndarray(
+                                    shape=(camera.input_resolution[1], camera.input_resolution[0], 3),
+                                    dtype=np.uint8,
+                                    buffer=map_info.data
+                                )
+                            else:
+                                # Fallback to target resolution if input resolution not known
+                                camera.last_frame = np.ndarray(
+                                    shape=(camera.resolution[1], camera.resolution[0], 3),
+                                    dtype=np.uint8,
+                                    buffer=map_info.data
+                                )
                             
                             # Return old frame to the pool
                             if old_frame is not None:
@@ -574,10 +610,20 @@ class WorkshopStream:
         # Ensure recordings directory exists
         os.makedirs("recordings", exist_ok=True)
         
+        # Get the resolution and frame rate of the first active camera for the pipeline
+        # Default to 1080p@30fps if no active cameras
+        width, height = 1920, 1080
+        framerate = 30
+        for camera in self.cameras.values():
+            if camera.active and camera.input_resolution:
+                width, height = camera.input_resolution
+                framerate = int(camera.frame_rate)  # Use actual camera frame rate
+                break
+        
         # Create GStreamer pipeline for recording
         pipeline_str = (
             'appsrc name=src is-live=true format=time do-timestamp=true ! '
-            'video/x-raw,format=BGR,width=1920,height=1080,framerate=60/1 ! '
+            f'video/x-raw,format=BGR,width={width},height={height},framerate={framerate}/1 ! '
             'videoconvert ! video/x-raw,format=I420 ! '
             'x264enc speed-preset=superfast tune=zerolatency bitrate=10000 key-int-max=60 ! '
             'h264parse ! matroskamux ! '
@@ -761,17 +807,25 @@ class WorkshopStream:
         # Increment frame counter
         self.frame_count += 1
         
-        # Get frame size
-        required_size = frame.nbytes
+        # Get frame size and dimensions
+        height, width = frame.shape[:2]
+        
+        # Find the active camera to get its frame rate
+        framerate = 30  # Default to 30fps
+        for camera in self.cameras.values():
+            if camera.active and camera.last_frame is frame:  # Check if this is the source frame
+                framerate = int(camera.frame_rate)
+                break
         
         # Create GStreamer buffer directly from frame data
         gst_buffer = Gst.Buffer.new_wrapped(frame.tobytes())
         
         # Set buffer timestamp
-        duration = 1 / 60 * Gst.SECOND  # Using 60 fps
+        duration = 1 / framerate * Gst.SECOND  # Use actual frame rate
         pts = (time.time() - self.start_time) * Gst.SECOND
         gst_buffer.pts = pts
         gst_buffer.duration = duration
+        
         
         # Push buffer to pipeline
         ret = self.recording_src.emit('push-buffer', gst_buffer)
@@ -831,17 +885,19 @@ class WorkshopStream:
         """Create picture-in-picture view with memory optimizations"""
         # Prepare output frames - get from pool
         output = self.frame_pool.get_frame((1080, 1920, 3))
-        clean_output = self.frame_pool.get_frame((1080, 1920, 3))
+        clean_output = None  # Will be set to original resolution frame
         
         # Initialize to black
         output.fill(0)
-        clean_output.fill(0)
         
         # Select main camera
         main_camera_name = self._select_main_camera()
         
         # If no main camera, return blank screen with UI
         if main_camera_name is None:
+            # Create clean output at 1080p for recording
+            clean_output = self.frame_pool.get_frame((1080, 1920, 3))
+            clean_output.fill(0)
             self.clean_frame_for_recording = clean_output
             output = self._add_ui_elements(output)
             return output
@@ -855,13 +911,25 @@ class WorkshopStream:
         main_frame = main_camera.last_frame
         
         if main_frame is None:
+            # Create clean output at 1080p for recording
+            clean_output = self.frame_pool.get_frame((1080, 1920, 3))
+            clean_output.fill(0)
             self.clean_frame_for_recording = clean_output
             output = self._add_ui_elements(output)
             return output
         
-        # Resize main camera frame directly to output
-        cv2.resize(main_frame, (1920, 1080), dst=output)
-        cv2.resize(main_frame, (1920, 1080), dst=clean_output)
+        # Store original frame for recording
+        clean_output = main_frame
+        
+        # Scale main frame to 1080p for display
+        scaled_frame = self.frame_pool.get_frame((1080, 1920, 3))
+        cv2.resize(main_frame, (1920, 1080), dst=scaled_frame)
+        
+        # Copy scaled frame to output
+        np.copyto(output, scaled_frame)
+        
+        # Return scaled frame to pool
+        self.frame_pool.return_frame(scaled_frame)
         
         # Add smaller overlays for active cameras (excluding main)
         pip_width = 480  # 1/4 of screen width
@@ -884,15 +952,12 @@ class WorkshopStream:
             if y + pip_height > 1080:
                 break
             
-            # Resize camera frame to PiP size
+            # Scale camera frame to PiP size
             cv2.resize(camera.last_frame, (pip_width, pip_height), dst=pip_frame)
             
             # Insert PiP into output frames with overlay effect
             region = output[y:y+pip_height, x:x+pip_width]
             cv2.addWeighted(pip_frame, 0.8, region, 0.2, 0, dst=region)
-            
-            clean_region = clean_output[y:y+pip_height, x:x+pip_width]
-            cv2.addWeighted(pip_frame, 0.8, clean_region, 0.2, 0, dst=clean_region)
         
         # Return PiP frame to pool
         self.frame_pool.return_frame(pip_frame)
@@ -935,30 +1000,28 @@ class WorkshopStream:
                 diff_color = cv2.applyColorMap(diff, cv2.COLORMAP_HOT)
                 
                 # Resize to full resolution
-                display_frame = self.frame_pool.get_frame(camera.resolution)
-                cv2.resize(diff_color, camera.resolution, dst=display_frame)
+                display_frame = self.frame_pool.get_frame((1080, 1920, 3))
+                cv2.resize(diff_color, (1920, 1080), dst=display_frame)
                 
                 # Add to frames list
                 frames.append((name, display_frame))
-                clean_frames.append((name, display_frame))  # Same for clean frames in motion view
+                clean_frames.append((name, camera.last_frame))  # Use original frame for recording
                 
                 # Return temporary frames to pool
                 self.frame_pool.return_frame(motion_frame)
                 self.frame_pool.return_frame(gray_frame)
                 self.frame_pool.return_frame(diff_color)
             else:
-                # For normal view, get frame from camera
-                display_frame = self.frame_pool.get_frame(camera.last_frame.shape)
-                
-                # Copy camera frame to avoid modifying original
-                np.copyto(display_frame, camera.last_frame)
+                # For normal view, scale frame to 1080p for display
+                display_frame = self.frame_pool.get_frame((1080, 1920, 3))
+                cv2.resize(camera.last_frame, (1920, 1080), dst=display_frame)
                 
                 # Add camera name overlay
                 self._add_camera_overlay(display_frame, camera)
                 
                 # Add to frames list
                 frames.append((name, display_frame))
-                clean_frames.append((name, camera.last_frame))  # Original frame for recording
+                clean_frames.append((name, camera.last_frame))  # Use original frame for recording
         
         # If no frames, return blank screen
         if not frames:
@@ -989,11 +1052,11 @@ class WorkshopStream:
             y = (i // grid_size) * cell_h
             x = (i % grid_size) * cell_w
             
-            # Resize frame to cell size
+            # Resize frame to cell size for display
             cv2.resize(frame, (cell_w, cell_h), dst=cell_frame)
             output[y:y+cell_h, x:x+cell_w] = cell_frame
             
-            # Resize clean frame
+            # For clean output, resize original frame to cell size
             cv2.resize(clean_frame, (cell_w, cell_h), dst=cell_frame)
             clean_output[y:y+cell_h, x:x+cell_w] = cell_frame
         
@@ -1046,13 +1109,17 @@ class WorkshopStream:
         camera.draw_bandwidth_graph(frame, graph_x, graph_y, graph_width, graph_height)
     
     def _add_ui_elements(self, frame: np.ndarray) -> np.ndarray:
-        """Add UI elements with memory-efficient approach"""
+        """Add UI elements with resolution-independent scaling"""
         # Get original frame dimensions
         h, w = frame.shape[:2]
+        base_height = 1080  # Reference height for UI scaling
         
-        # Constants for UI elements
-        top_bar_height = 60
-        bottom_bar_height = 50
+        # Scale UI elements based on frame height
+        scale_factor = h / base_height
+        
+        # Constants for UI elements (scaled)
+        top_bar_height = int(60 * scale_factor)
+        bottom_bar_height = int(50 * scale_factor)
         tab_width = w // 5  # 5 view modes
         
         # Create a canvas with extra space for UI
@@ -1088,14 +1155,16 @@ class WorkshopStream:
             
             # Add tab text with number
             tab_text = f"{num}: {name}"
-            text_size = cv2.getTextSize(tab_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+            font_scale = 0.8 * scale_factor
+            thickness = max(1, int(2 * scale_factor))
+            text_size = cv2.getTextSize(tab_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
             text_x = x_start + (tab_width - text_size[0]) // 2
             text_y = (top_bar_height + text_size[1]) // 2
             
             # Use white text for active tab, gray for inactive
             text_color = (255, 255, 255) if mode == self.view_mode else (180, 180, 180)
             cv2.putText(canvas, tab_text, (text_x, text_y), 
-                      cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
+                      cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, thickness)
         
         # Add keyboard shortcuts to bottom toolbar
         shortcuts = [
@@ -1110,11 +1179,13 @@ class WorkshopStream:
         shortcut_width = w // len(shortcuts)
         for i, shortcut in enumerate(shortcuts):
             x_start = i * shortcut_width
-            text_size = cv2.getTextSize(shortcut, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 1)[0]
+            font_scale = 0.7 * scale_factor
+            thickness = max(1, int(scale_factor))
+            text_size = cv2.getTextSize(shortcut, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
             text_x = x_start + (shortcut_width - text_size[0]) // 2
             text_y = top_bar_height + h + (bottom_bar_height + text_size[1]) // 2
             cv2.putText(canvas, shortcut, (text_x, text_y), 
-                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+                      cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
         
         # Create status indicators if needed
         indicators = []
@@ -1166,20 +1237,22 @@ class WorkshopStream:
         if indicators:
             # Calculate total width needed for the status bar
             total_width = 0
-            padding = 15  # Padding between indicators
+            padding = int(15 * scale_factor)  # Padding between indicators
             
             for label, value, _, has_bg in indicators:
                 display_text = f"{label}" if not value else f"{label}: {value}"
-                text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                font_scale = 0.8 * scale_factor
+                thickness = max(1, int(2 * scale_factor))
+                text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
                 # Width for text + spacing + background if needed
                 indicator_width = text_size[0] + padding
                 if has_bg:
-                    indicator_width += 20  # Extra space for background
+                    indicator_width += int(20 * scale_factor)  # Extra space for background
                 total_width += indicator_width
             
             # Create a semi-transparent background for the status bar
-            status_bar_height = 40
-            status_bar_y = top_bar_height + 10
+            status_bar_height = int(40 * scale_factor)
+            status_bar_y = top_bar_height + int(10 * scale_factor)
             status_bar_x = w - total_width - padding
             
             # Draw the rectangle for status bar background
@@ -1196,21 +1269,21 @@ class WorkshopStream:
             
             # Start position for the leftmost indicator
             x_pos = status_bar_x + padding
-            y_pos = status_bar_y + status_bar_height//2 + 5  # Adjust for text baseline
+            y_pos = status_bar_y + status_bar_height//2 + int(5 * scale_factor)  # Adjust for text baseline
             
             # Draw indicators from left to right
             for label, value, color, has_bg in indicators:
                 display_text = f"{label}" if not value else f"{label}: {value}"
-                text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
                 
                 # For status indicators (REC, LIVE, PAUSED), add a colored background
                 if has_bg:
                     # Calculate background rectangle dimensions
-                    bg_padding = 10
+                    bg_padding = int(10 * scale_factor)
                     bg_x = x_pos - bg_padding
-                    bg_y = status_bar_y + 5
+                    bg_y = status_bar_y + int(5 * scale_factor)
                     bg_w = text_size[0] + bg_padding * 2
-                    bg_h = status_bar_height - 10
+                    bg_h = status_bar_height - int(10 * scale_factor)
                     
                     # Draw colored background
                     cv2.rectangle(canvas, 
@@ -1220,14 +1293,14 @@ class WorkshopStream:
                     
                     # Draw text in white on colored background
                     cv2.putText(canvas, display_text, (x_pos, y_pos), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
                     
                     # Move right for next indicator with padding
                     x_pos += bg_w + padding
                 else:
                     # Draw regular text for camera name
                     cv2.putText(canvas, display_text, (x_pos, y_pos), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                              cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
                     
                     # Move right for next indicator with padding
                     x_pos += text_size[0] + padding
@@ -1318,23 +1391,28 @@ class WorkshopStream:
     
     def _handle_recording_and_streaming(self, view):
         """Handle recording and streaming of frames"""
+        # Get the main camera's frame for recording/streaming
+        main_camera_name = self._select_main_camera()
+        recording_frame = None
+        
+        if main_camera_name and self.cameras[main_camera_name].last_frame is not None:
+            recording_frame = self.cameras[main_camera_name].last_frame
+        else:
+            # If no main camera frame, create a blank frame
+            recording_frame = self.frame_pool.get_frame((1080, 1920, 3))
+            recording_frame.fill(0)
+        
         # Push frame to recording if active
         if self.recording:
-            # Use the clean_frame_for_recording which has no text overlays
-            if self.clean_frame_for_recording is not None:
-                self.push_frame_to_recording(self.clean_frame_for_recording)
-            else:
-                # Fallback to view
-                self.push_frame_to_recording(view)
+            self.push_frame_to_recording(recording_frame)
         
         # Push frame to streaming if active
         if self.streaming:
-            # Use the clean_frame_for_recording which has no text overlays
-            if self.clean_frame_for_recording is not None:
-                self.push_frame_to_streaming(self.clean_frame_for_recording)
-            else:
-                # Fallback to view
-                self.push_frame_to_streaming(view)
+            self.push_frame_to_streaming(recording_frame)
+            
+        # Return blank frame to pool if we created one
+        if recording_frame is not None and main_camera_name is None:
+            self.frame_pool.return_frame(recording_frame)
     
     def _handle_keyboard_input(self, key):
         """Handle keyboard input for the debug viewer"""
