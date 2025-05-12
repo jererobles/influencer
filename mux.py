@@ -114,6 +114,7 @@ class Camera:
     last_frame: Optional[np.ndarray] = None
     input_resolution: Optional[Tuple[int, int]] = None  # Actual input resolution
     aspect_ratio: float = 16/9   # Default aspect ratio
+    is_vertical: bool = False    # Flag for vertical orientation
     frozen_frame: Optional[np.ndarray] = None  # Last frame when connection was lost
     frozen_frame_time: float = 0  # Time when the frame was frozen
     
@@ -138,15 +139,23 @@ class Camera:
         """Update the input resolution and calculate aspect ratio"""
         self.input_resolution = (width, height)
         self.aspect_ratio = width / height
+        # Detect vertical orientation (aspect ratio < 1)
+        self.is_vertical = self.aspect_ratio < 1
         
     def get_scaled_resolution(self, target_width: int) -> Tuple[int, int]:
         """Calculate scaled resolution maintaining aspect ratio"""
         if not self.input_resolution:
             return (target_width, int(target_width / self.aspect_ratio))
             
-        # Calculate height based on aspect ratio
-        target_height = int(target_width / self.aspect_ratio)
-        return (target_width, target_height)
+        # For vertical videos, scale based on height instead of width
+        if self.is_vertical:
+            target_height = target_width  # Use full height
+            scaled_width = int(target_height * self.aspect_ratio)
+            return (scaled_width, target_height)
+        else:
+            # For horizontal videos, scale based on width
+            target_height = int(target_width / self.aspect_ratio)
+            return (target_width, target_height)
     
     @property
     def last_frame(self) -> Optional[np.ndarray]:
@@ -1159,7 +1168,7 @@ class WorkshopStream:
         framerate = 30  # Default to 30fps
         for camera in self.cameras.values():
             if camera.active and camera.last_frame is frame:  # Check if this is the source frame
-                framerate = int(camera.frame_rate)
+                framerate = max(1, int(camera.frame_rate))  # Ensure framerate is at least 1
                 break
         
         # Create GStreamer buffer directly from frame data
@@ -1170,7 +1179,6 @@ class WorkshopStream:
         pts = (time.time() - self.start_time) * Gst.SECOND
         gst_buffer.pts = pts
         gst_buffer.duration = duration
-        
         
         # Push buffer to pipeline
         ret = self.recording_src.emit('push-buffer', gst_buffer)
@@ -1255,10 +1263,29 @@ class WorkshopStream:
         
         # Scale main frame to 1080p for display
         scaled_frame = self.frame_pool.get_frame((1080, 1920, 3))
-        cv2.resize(main_frame, (1920, 1080), dst=scaled_frame)
         
-        # Copy scaled frame to output
-        np.copyto(output, scaled_frame)
+        if main_camera.is_vertical:
+            # For vertical videos, scale to full height and center horizontally
+            scale_factor = 1080 / main_frame.shape[0]
+            scaled_width = int(main_frame.shape[1] * scale_factor)
+            scaled_height = 1080
+            
+            # Create a temporary frame for scaling
+            temp_frame = self.frame_pool.get_frame((scaled_height, scaled_width, 3))
+            cv2.resize(main_frame, (scaled_width, scaled_height), dst=temp_frame)
+            
+            # Calculate centering offsets
+            x_offset = (1920 - scaled_width) // 2
+            
+            # Copy scaled frame to center of output
+            output[:, x_offset:x_offset+scaled_width] = temp_frame
+            
+            # Return temporary frame to pool
+            self.frame_pool.return_frame(temp_frame)
+        else:
+            # For horizontal videos, scale to full width
+            cv2.resize(main_frame, (1920, 1080), dst=scaled_frame)
+            np.copyto(output, scaled_frame)
         
         # Return scaled frame to pool
         self.frame_pool.return_frame(scaled_frame)
@@ -1288,12 +1315,31 @@ class WorkshopStream:
             # Get frame to display (use frozen frame if connection lost)
             display_frame = camera.frozen_frame if camera.connection_lost else camera.last_frame
             
-            # Scale camera frame to PiP size
-            cv2.resize(display_frame, (pip_width, pip_height), dst=pip_frame)
-            
-            # Insert PiP into output frames with overlay effect
-            region = output[y:y+pip_height, x:x+pip_width]
-            cv2.addWeighted(pip_frame, 0.8, region, 0.2, 0, dst=region)
+            if camera.is_vertical:
+                # For vertical videos in PiP, scale to full height and center horizontally
+                scale_factor = pip_height / display_frame.shape[0]
+                scaled_width = int(display_frame.shape[1] * scale_factor)
+                
+                # Create a temporary frame for scaling
+                temp_frame = self.frame_pool.get_frame((pip_height, scaled_width, 3))
+                cv2.resize(display_frame, (scaled_width, pip_height), dst=temp_frame)
+                
+                # Calculate centering offsets
+                x_offset = x + (pip_width - scaled_width) // 2
+                
+                # Copy scaled frame to center of PiP region
+                region = output[y:y+pip_height, x_offset:x_offset+scaled_width]
+                cv2.addWeighted(temp_frame, 0.8, region, 0.2, 0, dst=region)
+                
+                # Return temporary frame to pool
+                self.frame_pool.return_frame(temp_frame)
+            else:
+                # For horizontal videos in PiP, scale to PiP size
+                cv2.resize(display_frame, (pip_width, pip_height), dst=pip_frame)
+                
+                # Insert PiP into output frames with overlay effect
+                region = output[y:y+pip_height, x:x+pip_width]
+                cv2.addWeighted(pip_frame, 0.8, region, 0.2, 0, dst=region)
         
         # Return PiP frame to pool
         self.frame_pool.return_frame(pip_frame)
@@ -1313,23 +1359,59 @@ class WorkshopStream:
         clean_frames = []
         
         for name, camera in self.cameras.items():
-            # Skip if no frame available
-            if camera.last_frame is None and camera.frozen_frame is None:
+            try:
+                # Skip if no frame available
+                if camera.last_frame is None and camera.frozen_frame is None:
+                    continue
+                    
+                # Get frame to display (use frozen frame if connection lost)
+                display_frame = camera.frozen_frame if camera.connection_lost else camera.last_frame
+                
+                # Skip if frame is empty or invalid
+                if display_frame is None or display_frame.size == 0:
+                    log.warning(f"Empty frame received from camera {name}, skipping")
+                    continue
+                    
+                # Scale frame to 1080p for display
+                display_frame_scaled = self.frame_pool.get_frame((1080, 1920, 3))
+                try:
+                    if camera.is_vertical:
+                        # For vertical videos, scale to full height and center horizontally
+                        scale_factor = 1080 / display_frame.shape[0]
+                        scaled_width = int(display_frame.shape[1] * scale_factor)
+                        scaled_height = 1080
+                        
+                        # Create a temporary frame for scaling
+                        temp_frame = self.frame_pool.get_frame((scaled_height, scaled_width, 3))
+                        cv2.resize(display_frame, (scaled_width, scaled_height), dst=temp_frame)
+                        
+                        # Calculate centering offsets
+                        x_offset = (1920 - scaled_width) // 2
+                        
+                        # Copy scaled frame to center of output
+                        display_frame_scaled.fill(0)  # Clear the frame
+                        display_frame_scaled[:, x_offset:x_offset+scaled_width] = temp_frame
+                        
+                        # Return temporary frame to pool
+                        self.frame_pool.return_frame(temp_frame)
+                    else:
+                        # For horizontal videos, scale to full width
+                        cv2.resize(display_frame, (1920, 1080), dst=display_frame_scaled)
+                except cv2.error as e:
+                    log.error(f"Error resizing frame from camera {name}: {e}")
+                    self.frame_pool.return_frame(display_frame_scaled)
+                    continue
+                
+                # Add camera name overlay
+                self._add_camera_overlay(display_frame_scaled, camera)
+                
+                # Add to frames list
+                frames.append((name, display_frame_scaled))
+                clean_frames.append((name, display_frame))  # Use original frame for recording
+            except Exception as e:
+                log.error(f"Error processing frame from camera {name}: {e}")
+                # Don't mark as disconnected - let the connection timeout handle it
                 continue
-                
-            # Get frame to display (use frozen frame if connection lost)
-            display_frame = camera.frozen_frame if camera.connection_lost else camera.last_frame
-                
-            # Scale frame to 1080p for display
-            display_frame_scaled = self.frame_pool.get_frame((1080, 1920, 3))
-            cv2.resize(display_frame, (1920, 1080), dst=display_frame_scaled)
-            
-            # Add camera name overlay
-            self._add_camera_overlay(display_frame_scaled, camera)
-            
-            # Add to frames list
-            frames.append((name, display_frame_scaled))
-            clean_frames.append((name, display_frame))  # Use original frame for recording
         
         # If no frames, return blank screen
         if not frames:
@@ -1357,26 +1439,77 @@ class WorkshopStream:
         
         # Place frames in grid
         for i, ((name, frame), (_, clean_frame)) in enumerate(zip(frames, clean_frames)):
-            y = (i // grid_size) * cell_h
-            x = (i % grid_size) * cell_w
-            
-            # Resize frame to cell size for display
-            cv2.resize(frame, (cell_w, cell_h), dst=cell_frame)
-            output[y:y+cell_h, x:x+cell_w] = cell_frame
-            
-            # For clean output, resize original frame to cell size
-            cv2.resize(clean_frame, (cell_w, cell_h), dst=cell_frame)
-            clean_output[y:y+cell_h, x:x+cell_w] = cell_frame
-            
-            # Draw thick border if this is the main camera, accounting for the top bar
-            if self.cameras[name].main_camera:
-                line_width = 4
-                cv2.rectangle(
-                    output,
-                    (x + line_width-1, y + line_width-1),
-                    (x + cell_w - line_width+1, y + cell_h - line_width+1),
-                    (0, 255, 255), line_width
-                )
+            try:
+                y = (i // grid_size) * cell_h
+                x = (i % grid_size) * cell_w
+                
+                # Resize frame to cell size for display
+                try:
+                    camera = self.cameras[name]
+                    if camera.is_vertical:
+                        # For vertical videos in grid, scale to full height and center horizontally
+                        scale_factor = cell_h / frame.shape[0]
+                        scaled_width = int(frame.shape[1] * scale_factor)
+                        
+                        # Create a temporary frame for scaling
+                        temp_frame = self.frame_pool.get_frame((cell_h, scaled_width, 3))
+                        cv2.resize(frame, (scaled_width, cell_h), dst=temp_frame)
+                        
+                        # Calculate centering offsets
+                        x_offset = x + (cell_w - scaled_width) // 2
+                        
+                        # Copy scaled frame to center of cell
+                        cell_frame.fill(0)  # Clear the cell
+                        cell_frame[:, x_offset-x:x_offset-x+scaled_width] = temp_frame
+                        
+                        # Return temporary frame to pool
+                        self.frame_pool.return_frame(temp_frame)
+                    else:
+                        # For horizontal videos, scale to cell size
+                        cv2.resize(frame, (cell_w, cell_h), dst=cell_frame)
+                    
+                    output[y:y+cell_h, x:x+cell_w] = cell_frame
+                    
+                    # For clean output, resize original frame to cell size
+                    if camera.is_vertical:
+                        # For vertical videos in grid, scale to full height and center horizontally
+                        scale_factor = cell_h / clean_frame.shape[0]
+                        scaled_width = int(clean_frame.shape[1] * scale_factor)
+                        
+                        # Create a temporary frame for scaling
+                        temp_frame = self.frame_pool.get_frame((cell_h, scaled_width, 3))
+                        cv2.resize(clean_frame, (scaled_width, cell_h), dst=temp_frame)
+                        
+                        # Calculate centering offsets
+                        x_offset = x + (cell_w - scaled_width) // 2
+                        
+                        # Copy scaled frame to center of cell
+                        cell_frame.fill(0)  # Clear the cell
+                        cell_frame[:, x_offset-x:x_offset-x+scaled_width] = temp_frame
+                        
+                        # Return temporary frame to pool
+                        self.frame_pool.return_frame(temp_frame)
+                    else:
+                        # For horizontal videos, scale to cell size
+                        cv2.resize(clean_frame, (cell_w, cell_h), dst=cell_frame)
+                    
+                    clean_output[y:y+cell_h, x:x+cell_w] = cell_frame
+                except cv2.error as e:
+                    log.error(f"Error resizing cell frame for camera {name}: {e}")
+                    continue
+                
+                # Draw thick border if this is the main camera, accounting for the top bar
+                if self.cameras[name].main_camera:
+                    line_width = 4
+                    cv2.rectangle(
+                        output,
+                        (x + line_width-1, y + line_width-1),
+                        (x + cell_w - line_width+1, y + cell_h - line_width+1),
+                        (0, 255, 255), line_width
+                    )
+            except Exception as e:
+                log.error(f"Error placing frame in grid for camera {name}: {e}")
+                continue
         
         # Return cell frame to pool
         self.frame_pool.return_frame(cell_frame)
