@@ -31,10 +31,12 @@ class RTMPCameraController(SimpleRTMPController):
         logger.info(f"New RTMP stream: {publishing_name}")
         
         # Create RTMP URL for this stream
-        rtmp_url = f"rtmp://127.0.0.1:1935/{publishing_name}"
+        rtmp_url = f"rtmp://127.0.0.1:1935/live/{publishing_name}"
+        logger.info(f"Created RTMP URL: {rtmp_url}")
         
         # Add camera to manager first
         self.camera_manager.add_camera(rtmp_url, publishing_name)
+        logger.info(f"Added camera {publishing_name} to manager")
         
         # Get the camera instance that was just created
         camera = self.camera_manager.cameras[publishing_name]
@@ -96,6 +98,7 @@ class RTMPCameraController(SimpleRTMPController):
         """Handle incoming video messages from RTMP stream"""
         camera: Optional[Camera] = session.state
         if not camera or not camera.sink:
+            logger.warning(f"No camera or sink found for session")
             return
             
         try:
@@ -107,6 +110,12 @@ class RTMPCameraController(SimpleRTMPController):
             ret = camera.sink.emit('push-buffer', buffer)
             if ret != Gst.FlowReturn.OK:
                 logger.warning(f"Failed to push buffer to {camera.name}: {ret}")
+                if ret == Gst.FlowReturn.FLUSHING:
+                    logger.error(f"Pipeline is flushing for {camera.name}")
+                elif ret == Gst.FlowReturn.EOS:
+                    logger.error(f"Pipeline reached EOS for {camera.name}")
+                elif ret == Gst.FlowReturn.NOT_LINKED:
+                    logger.error(f"Pipeline elements not linked for {camera.name}")
                 
         except Exception as e:
             logger.error(f"Error processing video message for {camera.name}: {e}")
