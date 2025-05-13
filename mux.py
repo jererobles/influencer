@@ -16,6 +16,8 @@ import yaml  # Add import for yaml to load secrets
 import gc  # Explicit garbage collection
 import weakref  # For weak references
 import math  # Add import for math functions
+import subprocess  # Add import for subprocess to run caffeinate
+import atexit  # Add import for atexit to ensure cleanup
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 log = logging.getLogger(__name__)
@@ -399,6 +401,12 @@ class WorkshopStream:
         self.running = False
         self.debug = debug
         self.view_mode = ViewMode.OUTPUT
+        
+        # Add caffeinate process reference
+        self._caffeinate_process = None
+        
+        # Register cleanup function to ensure sleep prevention is disabled on exit
+        atexit.register(self._restore_sleep)
         
         # Recording related attributes
         self.recording = False
@@ -1991,10 +1999,40 @@ class WorkshopStream:
         
         return canvas
 
+    def _prevent_sleep(self) -> None:
+        """Prevent macOS from sleeping while the app is running"""
+        try:
+            # Start caffeinate in a new process
+            # -i prevents idle sleep
+            # -d prevents display sleep
+            # -m prevents disk sleep
+            self._caffeinate_process = subprocess.Popen(['caffeinate', '-i', '-d', '-m'])
+            log.info("Sleep prevention enabled")
+        except Exception as e:
+            log.error(f"Failed to prevent sleep: {e}")
+
+    def _restore_sleep(self) -> None:
+        """Restore normal sleep behavior"""
+        if self._caffeinate_process:
+            try:
+                self._caffeinate_process.terminate()
+                self._caffeinate_process.wait(timeout=5)  # Wait up to 5 seconds for process to terminate
+                log.info("Sleep prevention disabled")
+            except subprocess.TimeoutExpired:
+                self._caffeinate_process.kill()  # Force kill if it doesn't terminate
+                log.warning("Forced termination of sleep prevention")
+            except Exception as e:
+                log.error(f"Error restoring sleep: {e}")
+            finally:
+                self._caffeinate_process = None
+
     async def start(self) -> None:
         """Start the stream processing with explicit memory management"""
         log.info("Starting workshop stream")
         self.running = True
+        
+        # Prevent sleep when starting
+        self._prevent_sleep()
         
         # Create tasks for input view
         tasks = [
@@ -2279,7 +2317,8 @@ class WorkshopStream:
         for camera in self.cameras.values():
             camera.cleanup()
         
-        # No GStreamer buffers to clean up anymore
+        # Restore sleep behavior
+        self._restore_sleep()
         
         # Clean up other resources
         if self.debug:
