@@ -20,8 +20,9 @@ import subprocess  # Add import for subprocess to run caffeinate
 import atexit  # Add import for atexit to ensure cleanup
 import threading
 from pathlib import Path
+import queue  # Add this import for the thread-safe queue
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s | %(levelname)s | %(message)s')
 log = logging.getLogger(__name__)
 
 # Initialize GStreamer once
@@ -405,6 +406,13 @@ class WorkshopStream:
         self.debug = debug
         self.view_mode = ViewMode.OUTPUT
         
+        # Add task manager for camera tasks
+        self.camera_tasks: Dict[str, asyncio.Task] = {}
+        self.main_task: Optional[asyncio.Task] = None
+        
+        # Add thread-safe camera operation queue for RTMP server
+        self.camera_ops_queue = queue.Queue()
+        
         # Add caffeinate process reference
         self._caffeinate_process = None
         
@@ -498,13 +506,12 @@ class WorkshopStream:
                                 # Example: "is publishing to path 'live/mystream', 2 tracks (H264, MPEG-4 Audio)"
                                 try:
                                     path = line.split("path '")[1].split("'")[0]
-                                    rtsp_url = f"rtsp://localhost:8554/{path}"
+                                    rtsp_url = f"rtsp://127.0.0.1:8554/{path}"
                                     camera_name = f"RTMP-{path.split('/')[-1]}"
                                     
-                                    # Add the camera if it doesn't exist
-                                    if camera_name not in self.cameras:
-                                        log.info(f"Adding new RTMP stream: {camera_name} from {rtsp_url}")
-                                        self.add_camera(rtsp_url, camera_name)
+                                    # Add the camera operation to the thread-safe queue
+                                    self.camera_ops_queue.put(("add", camera_name, rtsp_url))
+                                    log.info(f"Queued add operation for camera: {camera_name}")
                                 except Exception as e:
                                     log.error(f"Error parsing RTMP publish message: {e}")
                                     
@@ -523,10 +530,9 @@ class WorkshopStream:
                                     # corresponds to which camera)
                                     if len(rtmp_cameras) == 1:
                                         camera_name = rtmp_cameras[0]
-                                        log.info(f"Removing RTMP stream: {camera_name}")
-                                        if camera_name in self.cameras:
-                                            self.cameras[camera_name].cleanup()
-                                            del self.cameras[camera_name]
+                                        # Add the remove operation to the queue
+                                        self.camera_ops_queue.put(("remove", camera_name))
+                                        log.info(f"Queued remove operation for camera: {camera_name}")
                                 except Exception as e:
                                     log.error(f"Error handling RTMP close message: {e}")
                                     
@@ -543,49 +549,6 @@ class WorkshopStream:
             log.error(f"Failed to start RTMP server: {e}")
             raise
 
-    def _monitor_rtmp_notifications(self):
-        """Monitor the notification pipe for new RTMP streams"""
-        try:
-            # Create named pipe if it doesn't exist
-            pipe_path = "/tmp/mediamtx_notify"
-            if not os.path.exists(pipe_path):
-                os.mkfifo(pipe_path)
-            
-            # Open pipe for reading
-            with open(pipe_path, 'r') as pipe:
-                while self.running:
-                    try:
-                        # Read notification
-                        line = pipe.readline().strip()
-                        if not line:
-                            continue
-                            
-                        # Parse notification
-                        if line.startswith("STREAM_READY:"):
-                            _, path, source_type, source_id = line.split(":")
-                            
-                            # Create RTSP URL for the stream
-                            rtsp_url = f"rtsp://localhost:8554/{path}"
-                            
-                            # Create a name for the camera based on the source
-                            camera_name = f"RTMP-{source_id}"
-                            
-                            # Add the camera if it doesn't exist
-                            if camera_name not in self.cameras:
-                                log.info(f"Adding new RTMP stream: {camera_name} from {rtsp_url}")
-                                self.add_camera(rtsp_url, camera_name)
-                    except Exception as e:
-                        log.error(f"Error processing RTMP notification: {e}")
-                        continue
-        except Exception as e:
-            log.error(f"Error in RTMP notification monitor: {e}")
-        finally:
-            # Clean up pipe
-            try:
-                os.unlink("/tmp/mediamtx_notify")
-            except:
-                pass
-
     async def start(self) -> None:
         """Start the stream processing with explicit memory management"""
         log.info("Starting workshop stream")
@@ -597,25 +560,157 @@ class WorkshopStream:
         # Start RTMP server
         self._start_rtmp_server()
         
-        # Create tasks for input view
-        tasks = [
-            asyncio.create_task(self._capture_frames(camera))
-            for camera in self.cameras.values()
-        ]
+        # Create tasks for existing cameras
+        for camera in self.cameras.values():
+            self._start_camera_task(camera)
         
         # Add debug viewer task if debug mode is enabled
         if self.debug:
-            tasks.append(asyncio.create_task(self._run_debug_viewer()))
+            self.main_task = asyncio.create_task(self._run_debug_viewer())
         
         try:
-            await asyncio.gather(*tasks)
+            # Wait for the main task (debug viewer) to complete
+            if self.main_task:
+                await self.main_task
         except (KeyboardInterrupt, asyncio.CancelledError):
             log.info("Shutting down...")
             self.running = False
-            for task in tasks:
+            # Cancel all camera tasks
+            for task in self.camera_tasks.values():
                 if not task.done():
                     task.cancel()
+            # Cancel main task if it exists
+            if self.main_task and not self.main_task.done():
+                self.main_task.cancel()
             self.stop()
+
+    async def _run_debug_viewer(self):
+        """Run debug viewer with memory management"""
+        try:
+            while self.running:
+                # Process any pending camera operations from RTMP server
+                self._process_camera_ops()
+                
+                # Update bandwidth for input view, including disconnected ones
+                current_time = time.time()
+                for camera in self.cameras.values():
+                    if camera.connection_lost:
+                        # Force bandwidth update for disconnected cameras
+                        camera.update_bandwidth(0, current_time)
+                
+                # Create debug view
+                view = await self._create_debug_view()
+                
+                # Handle auto-recording based on camera activity
+                self._handle_auto_recording()
+                
+                # Handle recording and streaming
+                self._handle_recording_and_streaming(view)
+                
+                # Show the view
+                cv2.imshow('Debug View', view)
+                
+                # Process keyboard input
+                key = cv2.waitKey(1) & 0xFF
+                self._handle_keyboard_input(key)
+                
+                # Return view frame to pool
+                self.frame_pool.return_frame(view)
+                
+                # Run garbage collection periodically
+                if self.frame_count % 600 == 0:  # Every 10 seconds at 60fps
+                    gc.collect()
+                
+                # Sleep to maintain frame rate
+                await asyncio.sleep(1/60)
+        finally:
+            cv2.destroyAllWindows()
+            if self.recording:
+                self.stop_recording()
+            if self.streaming:
+                self.stop_streaming()
+    
+    def _process_camera_ops(self):
+        """Process camera operations from the thread-safe queue"""
+        # Process up to 10 operations at a time to prevent blocking
+        for _ in range(10):
+            try:
+                # Get operation from queue (non-blocking)
+                op_type, *args = self.camera_ops_queue.get_nowait()
+                
+                if op_type == "add":
+                    camera_name, rtsp_url = args
+                    # Add the camera if it doesn't exist
+                    if camera_name not in self.cameras:
+                        log.info(f"Processing add operation: {camera_name} from {rtsp_url}")
+                        self.add_camera(rtsp_url, camera_name)
+                elif op_type == "remove":
+                    camera_name = args[0]
+                    # Remove the camera if it exists
+                    if camera_name in self.cameras:
+                        log.info(f"Processing remove operation: {camera_name}")
+                        self.remove_camera(camera_name)
+                
+                # Mark task as done
+                self.camera_ops_queue.task_done()
+            except queue.Empty:
+                # No more operations to process
+                break
+            except Exception as e:
+                log.error(f"Error processing camera operation: {e}")
+
+    def _start_camera_task(self, camera: Camera) -> None:
+        """Start a task for a camera if it doesn't already have one"""
+        if camera.name not in self.camera_tasks or self.camera_tasks[camera.name].done():
+            self.camera_tasks[camera.name] = asyncio.create_task(self._capture_frames(camera))
+            log.info(f"Started task for camera: {camera.name}")
+
+    def _stop_camera_task(self, camera_name: str) -> None:
+        """Stop a camera's task if it exists"""
+        if camera_name in self.camera_tasks:
+            task = self.camera_tasks[camera_name]
+            if not task.done():
+                task.cancel()
+            del self.camera_tasks[camera_name]
+            log.info(f"Stopped task for camera: {camera_name}")
+
+    def add_camera(self, url: str, name: str) -> None:
+        """Add a new camera to the stream"""
+        camera = Camera(url=url, name=name)
+        self.cameras[name] = camera
+        # Initialize retry state for the new camera
+        self.retry_manager.get_retry_state(name)
+        log.info(f"Added camera: {name} @ {url}")
+        
+        # Start a task for the new camera if the stream is running
+        if self.running:
+            self._start_camera_task(camera)
+
+    def remove_camera(self, name: str) -> None:
+        """Remove a camera from the stream"""
+        if name in self.cameras:
+            # Stop the camera's task
+            self._stop_camera_task(name)
+            
+            # Clean up camera resources
+            camera = self.cameras[name]
+            camera.cleanup()
+            
+            # Remove from cameras dict
+            del self.cameras[name]
+            
+            # Clean up retry state
+            self.retry_manager.cleanup(name)
+            
+            log.info(f"Removed camera: {name}")
+            
+            # If this was the main camera, select another one
+            if camera.main_camera:
+                new_main = self._select_main_camera()
+                if new_main:
+                    log.info(f"Switched main camera to {new_main} after removing {name}")
+                else:
+                    log.warning("No active cameras available to switch to")
 
     def stop(self) -> None:
         """Stop the stream processing and clean up resources"""
@@ -655,14 +750,6 @@ class WorkshopStream:
         # Run garbage collection
         gc.collect()
 
-    def add_camera(self, url: str, name: str) -> None:
-        """Add a new camera to the stream"""
-        camera = Camera(url=url, name=name)
-        self.cameras[name] = camera
-        # Initialize retry state for the new camera
-        self.retry_manager.get_retry_state(name)
-        log.info(f"Added camera: {name} @ {url}")
-        
     def _load_twitch_stream_key(self) -> str:
         """Load Twitch stream key from secrets.yaml file"""
         try:
@@ -2228,49 +2315,6 @@ class WorkshopStream:
             finally:
                 self._caffeinate_process = None
 
-    async def _run_debug_viewer(self):
-        """Run debug viewer with memory management"""
-        try:
-            while self.running:
-                # Update bandwidth for input view, including disconnected ones
-                current_time = time.time()
-                for camera in self.cameras.values():
-                    if camera.connection_lost:
-                        # Force bandwidth update for disconnected cameras
-                        camera.update_bandwidth(0, current_time)
-                
-                # Create debug view
-                view = await self._create_debug_view()
-                
-                # Handle auto-recording based on camera activity
-                self._handle_auto_recording()
-                
-                # Handle recording and streaming
-                self._handle_recording_and_streaming(view)
-                
-                # Show the view
-                cv2.imshow('Debug View', view)
-                
-                # Process keyboard input
-                key = cv2.waitKey(1) & 0xFF
-                self._handle_keyboard_input(key)
-                
-                # Return view frame to pool
-                self.frame_pool.return_frame(view)
-                
-                # Run garbage collection periodically
-                if self.frame_count % 600 == 0:  # Every 10 seconds at 60fps
-                    gc.collect()
-                
-                # Sleep to maintain frame rate
-                await asyncio.sleep(1/60)
-        finally:
-            cv2.destroyAllWindows()
-            if self.recording:
-                self.stop_recording()
-            if self.streaming:
-                self.stop_streaming()
-    
     def _handle_auto_recording(self):
         """Handle auto-recording logic"""
         if not self.auto_recording:
