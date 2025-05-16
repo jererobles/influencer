@@ -785,7 +785,7 @@ class WorkshopStream:
             return ''
         
     def _create_camera_pipeline(self, camera: Camera) -> None:
-        """Create and configure GStreamer pipeline for a camera"""
+        """Create and configure GStreamer pipeline for a camera using uridecodebin"""
         # Create GStreamer pipeline based on camera URL type
         if camera.url.isdigit():  # USB webcam
             pipeline_str = (
@@ -794,29 +794,57 @@ class WorkshopStream:
                 'videoconvert ! video/x-raw,format=BGR ! '
                 'appsink name=sink emit-signals=True max-buffers=4096 drop=False'
             )
-        elif camera.url.startswith('http://'):  # HTTP stream
+        else:  # RTSP/HTTP stream
+            # pipeline_str = (
+            #     f'uridecodebin uri={camera.url} name=src ! '
+            #     'queue max-size-buffers=4096 max-size-bytes=0 max-size-time=0 ! '
+            #     'videoconvert ! video/x-raw,format=BGR ! '
+            #     'appsink name=sink emit-signals=True max-buffers=4096 drop=False'
+            # )
+            # os.environ["GST_RTSP_TRANSPORT"] = "udp"
             pipeline_str = (
-                f'souphttpsrc location={camera.url} ! '
-                'decodebin ! videoconvert ! video/x-raw,format=BGR ! '
-                'appsink name=sink emit-signals=True max-buffers=4096 drop=False'
+                f'uridecodebin uri={camera.url} name=src '
+                'src. ! queue max-size-time=10000000000 leaky=downstream ! '
+                'videoconvert ! videorate max-rate=30 ! '
+                'videoscale method=lanczos ! video/x-raw,width=1280,height=720,format=BGR ! '
+                'videobalance contrast=1.1 brightness=0.05 ! '
+                'appsink name=sink emit-signals=True drop=False sync=false '
+                'src. ! queue max-size-time=10000000000 leaky=downstream ! '
+                'audioconvert ! audioresample quality=10 ! volume volume=1.5 ! '
+                'autoaudiosink sync=false'
             )
-        else:  # RTSP stream
-            pipeline_str = (
-                f'rtspsrc location={camera.url} latency=100 buffer-mode=auto do-retransmission=true '
-                'drop-on-latency=false ntp-sync=false protocols=tcp ! '
-                'rtpjitterbuffer latency=500 drop-on-latency=false ! '
-                'queue max-size-buffers=4096 max-size-bytes=0 max-size-time=0 ! '
-                'rtph264depay ! h264parse ! '
-                'avdec_h264 max-threads=4 ! '
-                'videoconvert ! video/x-raw,format=BGR ! '
-                'appsink name=sink emit-signals=True max-buffers=4096 drop=False'
-            )
-
+# GST_RTSP_TRANSPORT=tcp gst-launch-1.0 uridecodebin uri=rtsp://192.168.1.155:8554/live name=src \
+#   src. ! queue max-size-time=10000000000 leaky=downstream ! videoconvert ! videorate max-rate=30 ! \
+#   videoscale method=lanczos ! video/x-raw,width=1280,height=720 ! videobalance contrast=1.1 brightness=0.05 ! \
+#   autovideosink sync=false \
+#   src. ! queue max-size-time=10000000000 leaky=downstream ! \
+#   audioconvert ! audioresample quality=10 ! volume volume=1.5 ! \
+#   autoaudiosink sync=false
         log.debug(f"Creating pipeline for {camera.name}: {pipeline_str}")
         
         # Create and store the pipeline in the camera object
         camera.pipeline = Gst.parse_launch(pipeline_str)
         camera.sink = camera.pipeline.get_by_name('sink')
+        
+        # For network streams, we need to handle dynamic pad creation
+        if not camera.url.isdigit():
+            src = camera.pipeline.get_by_name('src')
+            
+            def on_pad_added(element, pad):
+                # Get pad capabilities
+                caps = pad.query_caps(None)
+                if caps:
+                    # Check if this is a video pad
+                    if caps.is_subset(Gst.Caps.from_string('video/x-raw')):
+                        # Get the queue element
+                        queue = camera.pipeline.get_by_name('queue0')
+                        if queue:
+                            # Link the pad to the queue
+                            pad.link(queue.get_static_pad('sink'))
+                            log.debug(f"Linked video pad for {camera.name}")
+            
+            # Connect to pad-added signal
+            src.connect('pad-added', on_pad_added)
         
         # Add bus watch to monitor pipeline state changes and errors
         bus = camera.pipeline.get_bus()
@@ -1289,30 +1317,55 @@ class WorkshopStream:
         for camera in self.cameras.values():
             if camera.active and camera.input_resolution:
                 width, height = camera.input_resolution
-                framerate = int(camera.frame_rate)  # Use actual camera frame rate
+                framerate = max(1, int(camera.frame_rate))  # Ensure framerate is at least 1
                 break
         
-        # Create GStreamer pipeline for recording
+        # Create GStreamer pipeline for recording to MKV file with audio
         pipeline_str = (
-            'appsrc name=src is-live=true format=time do-timestamp=true ! '
+            # Video branch
+            'appsrc name=videosrc is-live=true format=time do-timestamp=true ! '
             f'video/x-raw,format=BGR,width={width},height={height},framerate={framerate}/1 ! '
             'videoconvert ! video/x-raw,format=I420 ! '
             'x264enc speed-preset=superfast tune=zerolatency bitrate=10000 key-int-max=60 ! '
-            'h264parse ! matroskamux ! '
-            f'filesink location={output_file}'
+            'h264parse ! '
+            'queue ! mux. '
+            # Audio branch - mix audio from all active cameras
+            'audiomixer name=mixer ! '
+            'audioconvert ! audioresample ! '
+            'audiorate ! audio/x-raw,rate=48000 ! '
+            'avenc_aac bitrate=192000 ! aacparse ! '
+            'queue ! mux. '
+            # Muxer
+            'matroskamux name=mux ! '
+            f'filesink location={output_file} sync=false'
         )
+        
+        # Add audio sources for each active camera
+        for i, camera in enumerate(self.cameras.values()):
+            if camera.active and not camera.connection_lost:
+                # Add audio source for this camera
+                pipeline_str = (
+                    f'uridecodebin uri={camera.url} name=src{i} '
+                    f'src{i}. ! queue ! audioconvert ! audio/x-raw,rate=48000 ! '
+                    'audiorate ! mixer. ' + pipeline_str
+                )
         
         log.info(f"Creating recording pipeline: {pipeline_str}")
         
         try:
             self.recording_pipeline = Gst.parse_launch(pipeline_str)
-            self.recording_src = self.recording_pipeline.get_by_name('src')
+            self.recording_src = self.recording_pipeline.get_by_name('videosrc')
             
             # Configure appsrc for controlled pushing
             self.recording_src.set_property('emit-signals', True)
             self.recording_src.set_property('block', False)  # Non-blocking mode
             self.recording_src.set_property('max-bytes', 0)  # No limit on queue size
             self.recording_src.set_property('format', Gst.Format.TIME)
+            
+            # Set up bus watch for error handling
+            bus = self.recording_pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect('message', self._on_recording_bus_message)
             
             # Start the pipeline
             self.recording_pipeline.set_state(Gst.State.PLAYING)
@@ -1321,11 +1374,57 @@ class WorkshopStream:
             self.frame_count = 0
             self.start_time = time.time()
             self.pause_start_time = 0  # Initialize pause start time
-            log.info(f"Started recording to {output_file}")
+            log.info(f"Started recording to {output_file} with audio")
         except Exception as e:
             log.error(f"Failed to start recording: {e}")
             self.recording = False
             self._cleanup_recording_pipeline()
+
+    def _handle_camera_activity(self, camera: Camera) -> None:
+        """Handle camera activity changes and update recording pipeline if needed"""
+        if not self.recording or self.recording_paused:
+            return
+            
+        # Get the mixer element
+        mixer = self.recording_pipeline.get_by_name('mixer')
+        if not mixer:
+            return
+            
+        # Get the camera's audio source
+        src_name = f"src{list(self.cameras.values()).index(camera)}"
+        src = self.recording_pipeline.get_by_name(src_name)
+        if not src:
+            return
+            
+        if camera.active and not camera.connection_lost:
+            # Camera is active, ensure its audio is connected
+            if not src.get_state(0)[1] == Gst.State.PLAYING:
+                src.set_state(Gst.State.PLAYING)
+                log.debug(f"Enabled audio for camera {camera.name}")
+        else:
+            # Camera is inactive, stop its audio
+            if src.get_state(0)[1] == Gst.State.PLAYING:
+                src.set_state(Gst.State.NULL)
+                log.debug(f"Disabled audio for camera {camera.name}")
+
+    def _on_recording_bus_message(self, bus, message) -> bool:
+        """Handle GStreamer bus messages for recording pipeline"""
+        t = message.type
+        if t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            log.error(f"Pipeline error: {err.message}")
+            log.debug(f"Debug info: {debug}")
+            self.recording = False
+            self._cleanup_recording_pipeline()
+        elif t == Gst.MessageType.STATE_CHANGED:
+            old_state, new_state, pending_state = message.parse_state_changed()
+            if message.src == self.recording_pipeline:
+                log.debug(f"Pipeline state changed: {old_state.value_nick} -> {new_state.value_nick}")
+        elif t == Gst.MessageType.EOS:
+            log.warning("End of stream")
+            self.recording = False
+            self._cleanup_recording_pipeline()
+        return True
 
     def pause_recording(self) -> None:
         """Pause the current recording without stopping the pipeline"""
@@ -1385,15 +1484,26 @@ class WorkshopStream:
     def _cleanup_recording_pipeline(self) -> None:
         """Clean up recording pipeline resources"""
         if self.recording_pipeline:
-            # Send EOS and wait for it to propagate
-            self.recording_pipeline.send_event(Gst.Event.new_eos())
-            
-            # Set pipeline to NULL state
-            self.recording_pipeline.set_state(Gst.State.NULL)
-            
-            # Clear references
-            self.recording_pipeline = None
-            self.recording_src = None
+            try:
+                # Send EOS and wait for it to propagate
+                self.recording_pipeline.send_event(Gst.Event.new_eos())
+                
+                # Set pipeline to NULL state
+                self.recording_pipeline.set_state(Gst.State.NULL)
+                
+                # Clear references
+                self.recording_pipeline = None
+                self.recording_src = None
+                
+                # Reset state
+                self.recording = False
+                self.streaming = False
+                self.recording_paused = False
+                
+                # Run garbage collection
+                gc.collect()
+            except Exception as e:
+                log.error(f"Error cleaning up recording pipeline: {e}")
 
     def start_streaming(self) -> None:
         """Start streaming to Twitch"""
@@ -1403,6 +1513,11 @@ class WorkshopStream:
             
         if not self.twitch_stream_key:
             log.error("Cannot start streaming: No Twitch stream key found in secrets.yaml")
+            return
+            
+        # If we're already recording, streaming is handled by the integrated pipeline
+        if self.recording:
+            log.info("Streaming is already active through the integrated pipeline")
             return
             
         # Create GStreamer pipeline for streaming to Twitch
@@ -1427,6 +1542,11 @@ class WorkshopStream:
             self.streaming_src.set_property('max-bytes', 0)  # No limit on queue size
             self.streaming_src.set_property('format', Gst.Format.TIME)
             
+            # Set up bus watch for error handling
+            bus = self.streaming_pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect('message', self._on_streaming_bus_message)
+            
             # Start the pipeline
             self.streaming_pipeline.set_state(Gst.State.PLAYING)
             self.streaming = True
@@ -1435,20 +1555,48 @@ class WorkshopStream:
             log.error(f"Failed to start streaming: {e}")
             self.streaming = False
             self._cleanup_streaming_pipeline()
-    
+
+    def _on_streaming_bus_message(self, bus, message) -> bool:
+        """Handle GStreamer bus messages for streaming pipeline"""
+        t = message.type
+        if t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            log.error(f"Streaming pipeline error: {err.message}")
+            log.debug(f"Debug info: {debug}")
+            self.streaming = False
+            self._cleanup_streaming_pipeline()
+        elif t == Gst.MessageType.STATE_CHANGED:
+            old_state, new_state, pending_state = message.parse_state_changed()
+            if message.src == self.streaming_pipeline:
+                log.debug(f"Streaming pipeline state changed: {old_state.value_nick} -> {new_state.value_nick}")
+        elif t == Gst.MessageType.EOS:
+            log.warning("End of streaming")
+            self.streaming = False
+            self._cleanup_streaming_pipeline()
+        return True
+
     def _cleanup_streaming_pipeline(self) -> None:
         """Clean up streaming pipeline resources"""
         if self.streaming_pipeline:
-            # Send EOS and wait for it to propagate
-            self.streaming_pipeline.send_event(Gst.Event.new_eos())
-            
-            # Set pipeline to NULL state
-            self.streaming_pipeline.set_state(Gst.State.NULL)
-            
-            # Clear references
-            self.streaming_pipeline = None
-            self.streaming_src = None
-    
+            try:
+                # Send EOS and wait for it to propagate
+                self.streaming_pipeline.send_event(Gst.Event.new_eos())
+                
+                # Set pipeline to NULL state
+                self.streaming_pipeline.set_state(Gst.State.NULL)
+                
+                # Clear references
+                self.streaming_pipeline = None
+                self.streaming_src = None
+                
+                # Reset state
+                self.streaming = False
+                
+                # Run garbage collection
+                gc.collect()
+            except Exception as e:
+                log.error(f"Error cleaning up streaming pipeline: {e}")
+
     def stop_streaming(self) -> None:
         """Stop streaming to Twitch"""
         if not self.streaming:
@@ -1456,14 +1604,14 @@ class WorkshopStream:
             
         log.info("Stopping Twitch stream")
         
+        # If we're recording, streaming is handled by the integrated pipeline
+        if self.recording:
+            log.info("Streaming is part of the integrated pipeline - use stop_recording() instead")
+            return
+        
         # Properly clean up the pipeline
         self._cleanup_streaming_pipeline()
-        
-        self.streaming = False
-        
-        # Run garbage collection after stopping streaming
-        gc.collect()
-    
+
     def toggle_streaming(self) -> None:
         """Toggle streaming on/off"""
         if self.streaming:
@@ -1472,7 +1620,7 @@ class WorkshopStream:
             self.start_streaming()
             
     def push_frame_to_recording(self, frame: np.ndarray) -> None:
-        """Push a frame to the recording pipeline using zero-copy approach"""
+        """Push a frame to the integrated pipeline using zero-copy approach"""
         if not self.recording or self.recording_paused or self.recording_src is None:
             return
             
@@ -1489,46 +1637,66 @@ class WorkshopStream:
                 framerate = max(1, int(camera.frame_rate))  # Ensure framerate is at least 1
                 break
         
-        # Create GStreamer buffer directly from frame data
-        gst_buffer = Gst.Buffer.new_wrapped(frame.tobytes())
-        
-        # Set buffer timestamp
-        duration = 1 / framerate * Gst.SECOND  # Use actual frame rate
-        pts = (time.time() - self.start_time) * Gst.SECOND
-        gst_buffer.pts = pts
-        gst_buffer.duration = duration
-        
-        # Push buffer to pipeline
-        ret = self.recording_src.emit('push-buffer', gst_buffer)
-        
-        # Explicitly release reference to help garbage collection
-        gst_buffer = None
-        
-        if ret != Gst.FlowReturn.OK:
-            log.warning(f"Error pushing buffer to recording: {ret}")
+        try:
+            # Create GStreamer buffer directly from frame data
+            gst_buffer = Gst.Buffer.new_wrapped(frame.tobytes())
+            
+            # Set buffer timestamp
+            duration = 1 / framerate * Gst.SECOND  # Use actual frame rate
+            pts = (time.time() - self.start_time) * Gst.SECOND
+            gst_buffer.pts = pts
+            gst_buffer.duration = duration
+            
+            # Push buffer to pipeline
+            ret = self.recording_src.emit('push-buffer', gst_buffer)
+            
+            # Explicitly release reference to help garbage collection
+            gst_buffer = None
+            
+            if ret != Gst.FlowReturn.OK:
+                log.warning(f"Error pushing buffer to pipeline: {ret}")
+                if ret == Gst.FlowReturn.FLUSHING:
+                    # Pipeline is being shut down
+                    self.recording = False
+                    self.streaming = False
+                    self._cleanup_recording_pipeline()
+        except Exception as e:
+            log.error(f"Error in push_frame_to_recording: {e}")
+            self.recording = False
+            self.streaming = False
+            self._cleanup_recording_pipeline()
     
     def push_frame_to_streaming(self, frame: np.ndarray) -> None:
         """Push a frame to the streaming pipeline using zero-copy approach"""
         if not self.streaming or self.streaming_src is None:
             return
         
-        # Create GStreamer buffer directly from frame data
-        gst_buffer = Gst.Buffer.new_wrapped(frame.tobytes())
-        
-        # Set buffer timestamp
-        duration = 1 / 60 * Gst.SECOND  # Using 60 fps
-        pts = time.time() * Gst.SECOND
-        gst_buffer.pts = pts
-        gst_buffer.duration = duration
-        
-        # Push buffer to pipeline
-        ret = self.streaming_src.emit('push-buffer', gst_buffer)
-        
-        # Explicitly release reference to help garbage collection
-        gst_buffer = None
-        
-        if ret != Gst.FlowReturn.OK:
-            log.warning(f"Error pushing buffer to streaming: {ret}")
+        try:
+            # Create GStreamer buffer directly from frame data
+            gst_buffer = Gst.Buffer.new_wrapped(frame.tobytes())
+            
+            # Set buffer timestamp
+            duration = 1 / 60 * Gst.SECOND  # Using 60 fps
+            pts = time.time() * Gst.SECOND
+            gst_buffer.pts = pts
+            gst_buffer.duration = duration
+            
+            # Push buffer to pipeline
+            ret = self.streaming_src.emit('push-buffer', gst_buffer)
+            
+            # Explicitly release reference to help garbage collection
+            gst_buffer = None
+            
+            if ret != Gst.FlowReturn.OK:
+                log.warning(f"Error pushing buffer to streaming: {ret}")
+                if ret == Gst.FlowReturn.FLUSHING:
+                    # Pipeline is being shut down
+                    self.streaming = False
+                    self._cleanup_streaming_pipeline()
+        except Exception as e:
+            log.error(f"Error in push_frame_to_streaming: {e}")
+            self.streaming = False
+            self._cleanup_streaming_pipeline()
     
     async def _create_debug_view(self) -> np.ndarray:
         """Create debug view based on current view mode with memory optimizations"""
@@ -2341,6 +2509,7 @@ class WorkshopStream:
         if not self.auto_recording:
             return
             
+        # Check if any camera is active
         any_active = self._any_camera_active()
         
         # Start recording if any camera is active and we're not recording
@@ -2356,7 +2525,12 @@ class WorkshopStream:
             # Store the time when we pause
             self.pause_start_time = time.time()
             self.pause_recording()
-    
+        
+        # Update audio sources based on camera activity
+        if self.recording and not self.recording_paused:
+            for camera in self.cameras.values():
+                self._handle_camera_activity(camera)
+
     def _handle_recording_and_streaming(self, view):
         """Handle recording and streaming of frames"""
         # Get the main camera's frame for recording/streaming
@@ -2381,7 +2555,7 @@ class WorkshopStream:
         # Return blank frame to pool if we created one
         if recording_frame is not None and main_camera_name is None:
             self.frame_pool.return_frame(recording_frame)
-    
+
     def _handle_keyboard_input(self, key):
         """Handle keyboard input for the debug viewer"""
         if key == ord('q'):
@@ -2424,7 +2598,7 @@ class WorkshopStream:
             self._cycle_main_camera()
         elif key == ord('r'):  # 'r' to remux last recording
             self._remux_last_recording()
-    
+
     def _toggle_lock_current_camera(self):
         """Lock or unlock the current main camera"""
         # Get current main camera
@@ -2507,13 +2681,14 @@ class WorkshopStream:
                 
             log.info(f"Remuxing {last_mkv} to {output_mp4}")
             
-            # Create GStreamer pipeline for remuxing
+            # Create GStreamer pipeline for remuxing with both video and audio
             pipeline_str = (
                 f'filesrc location={last_mkv} ! '
-                'matroskademux ! '
-                'h264parse ! '
-                'mp4mux ! '
-                f'filesink location={output_mp4}'
+                'matroskademux name=demux '
+                'mp4mux name=mp4mux ! '
+                f'filesink location={output_mp4} '
+                'demux.video_0 ! h264parse ! queue ! mp4mux.video_0 '
+                'demux.audio_0 ! aacparse ! queue ! mp4mux.audio_0'
             )
             
             # Create and run pipeline
@@ -2532,6 +2707,7 @@ class WorkshopStream:
                 if msg.type == Gst.MessageType.ERROR:
                     err, debug = msg.parse_error()
                     log.error(f"Error during remuxing: {err.message}")
+                    log.debug(f"Debug info: {debug}")
                     if os.path.exists(output_mp4):
                         os.remove(output_mp4)  # Clean up failed output
                 else:
@@ -2545,8 +2721,8 @@ class WorkshopStream:
 if __name__ == "__main__":
     # Quick test with debug viewer
     stream = WorkshopStream(debug=True)
-    # stream.add_camera("rtsp://192.168.1.155:8554/live", "iphone 13")
-    stream.add_camera("rtsp://192.168.1.156:8554/live", "iphone xs")
+    stream.add_camera("rtsp://192.168.1.155:8554/live", "iphone 13")
+    # stream.add_camera("rtsp://192.168.1.156:8554/live", "iphone xs")
     # stream.add_camera("rtsp://192.168.1.114:8080/h264_pcm.sdp", "galaxy s21")
     
     print("Controls:")
