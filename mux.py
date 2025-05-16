@@ -470,6 +470,9 @@ class WorkshopStream:
         self.rtmp_notify_fd = None
         self.rtmp_notify_thread = None
 
+        # Add connection tracking for RTMP streams
+        self.rtmp_connections = {}  # Map IP:port -> camera_name
+
     def _start_rtmp_server(self):
         """Start the RTMP server in the background"""
         try:
@@ -509,6 +512,13 @@ class WorkshopStream:
                                     rtsp_url = f"rtsp://127.0.0.1:8554/{path}"
                                     camera_name = f"RTMP-{path.split('/')[-1]}"
                                     
+                                    # Extract connection info - looks like [conn 192.168.1.155:50058]
+                                    if "[conn " in line:
+                                        conn_info = line.split("[conn ")[1].split("]")[0]
+                                        # Store the association between connection and camera
+                                        self.rtmp_connections[conn_info] = camera_name
+                                        log.info(f"Tracking RTMP connection {conn_info} for camera {camera_name}")
+                                    
                                     # Add the camera operation to the thread-safe queue
                                     self.camera_ops_queue.put(("add", camera_name, rtsp_url))
                                     log.info(f"Queued add operation for camera: {camera_name}")
@@ -519,20 +529,28 @@ class WorkshopStream:
                                 # RTMP connection closed, find and remove the corresponding camera
                                 try:
                                     # Extract connection info from message
-                                    # Example: "[conn [::1]:63551] closed: EOF"
-                                    conn_info = line.split("[conn ")[1].split("]")[0]
-                                    
-                                    # Find cameras that were added from RTMP
-                                    rtmp_cameras = [name for name in self.cameras.keys() if name.startswith("RTMP-")]
-                                    
-                                    # If we have only one RTMP camera, remove it
-                                    # (This is a simplification - in a real app you'd want to track which connection
-                                    # corresponds to which camera)
-                                    if len(rtmp_cameras) == 1:
-                                        camera_name = rtmp_cameras[0]
-                                        # Add the remove operation to the queue
-                                        self.camera_ops_queue.put(("remove", camera_name))
-                                        log.info(f"Queued remove operation for camera: {camera_name}")
+                                    # Example: "[conn 192.168.1.155:50058] closed: EOF"
+                                    if "[conn " in line:
+                                        conn_info = line.split("[conn ")[1].split("]")[0]
+                                        
+                                        # Find the camera associated with this connection
+                                        camera_name = self.rtmp_connections.get(conn_info)
+                                        
+                                        if camera_name:
+                                            # Add the remove operation to the queue
+                                            self.camera_ops_queue.put(("remove", camera_name))
+                                            log.info(f"RTMP connection {conn_info} closed, queued remove operation for camera: {camera_name}")
+                                            
+                                            # Remove from connection tracking
+                                            del self.rtmp_connections[conn_info]
+                                        else:
+                                            # Fallback to the old method if we don't have tracking info
+                                            rtmp_cameras = [name for name in self.cameras.keys() if name.startswith("RTMP-")]
+                                            if len(rtmp_cameras) == 1:
+                                                camera_name = rtmp_cameras[0]
+                                                # Add the remove operation to the queue
+                                                self.camera_ops_queue.put(("remove", camera_name))
+                                                log.info(f"Queued remove operation for camera: {camera_name} (using fallback method)")
                                 except Exception as e:
                                     log.error(f"Error handling RTMP close message: {e}")
                                     
@@ -725,6 +743,9 @@ class WorkshopStream:
         # Clean up cameras
         for camera in self.cameras.values():
             camera.cleanup()
+        
+        # Clear connection tracking
+        self.rtmp_connections.clear()
         
         # Stop RTMP server
         if self.rtmp_server_process:
