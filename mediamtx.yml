@@ -1,0 +1,38 @@
+# MediaMTX configuration for simple RTMP/SRT server
+logLevel: info
+logDestinations: [stdout]
+
+api: yes
+apiAddress: :9997
+metrics: yes
+metricsAddress: :9998
+pprof: yes
+pprofAddress: :9999
+
+rtspAddress: :8554
+rtspsAddress: :8322
+rtpAddress: :8000
+rtcpAddress: :8001
+rtmpAddress: :1935
+hlsAddress: :8888
+webrtcAddress: :8889
+srtAddress: :8890
+
+# Path configuration
+paths:
+  # Default path for live streaming
+  live:
+    source: publisher
+    
+    # Record streams to disk (disabled by default)
+    record: no
+    # recordPath: ./recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+
+    # Command to run when the stream is ready to be read
+    runOnReady: |
+      #!/bin/sh
+      # Notify the main application about the new stream
+      echo "STREAM_READY:$MTX_PATH:$MTX_SOURCE_TYPE:$MTX_SOURCE_ID" > /tmp/mediamtx_notify
+
+  # Catch-all for all other paths
+  all_others:

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build/Run Commands
 - Run application: `python mux.py`
-- Install dependencies: `pip install -r requirements.txt` or use `uv` package manager
+- Install dependencies: use `uv` package manager, project requirements live in pyproject.toml
 
 ## Code Style Guidelines
 - Follow PEP 8 for Python code style

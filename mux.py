@@ -18,6 +18,8 @@ import weakref  # For weak references
 import math  # Add import for math functions
 import subprocess  # Add import for subprocess to run caffeinate
 import atexit  # Add import for atexit to ensure cleanup
+import threading
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 log = logging.getLogger(__name__)
@@ -309,6 +311,7 @@ class Camera:
                     self.frozen_frame_time = current_time
                 except Exception as e:
                     log.error(f"Error creating frozen frame for {self.name}: {e}")
+                    # If we can't create a frozen frame, just use the last frame
                     self.frozen_frame = self.last_frame.copy()
                     self.frozen_frame_time = current_time
 
@@ -453,6 +456,205 @@ class WorkshopStream:
         self.last_tab_time = 0
         self.tab_cooldown = 5.0  # 5 seconds cooldown
         
+        # RTMP server integration
+        self.rtmp_server = None
+        self.rtmp_server_process = None
+        self.rtmp_notify_fd = None
+        self.rtmp_notify_thread = None
+
+    def _start_rtmp_server(self):
+        """Start the RTMP server in the background"""
+        try:
+            # Import here to avoid circular imports
+            from rtmp_srt_server import get_mediamtx, create_config, run_server
+            
+            # Get MediaMTX binary
+            executable = get_mediamtx()
+            
+            # Create config file
+            config_path = Path.cwd() / "mediamtx.yml"
+            create_config(config_path)
+            
+            # Start server in background with output capture
+            self.rtmp_server_process = subprocess.Popen(
+                [str(executable), str(config_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                bufsize=1  # Line buffered
+            )
+            
+            # Start a thread to read and log the server output
+            def log_server_output():
+                while self.running and self.rtmp_server_process:
+                    try:
+                        line = self.rtmp_server_process.stdout.readline()
+                        if line:
+                            log.info(f"[RTMP Server] {line.strip()}")
+                            
+                            # Parse RTMP server messages for camera lifecycle events
+                            if "is publishing to path" in line:
+                                # Extract path from message
+                                # Example: "is publishing to path 'live/mystream', 2 tracks (H264, MPEG-4 Audio)"
+                                try:
+                                    path = line.split("path '")[1].split("'")[0]
+                                    rtsp_url = f"rtsp://localhost:8554/{path}"
+                                    camera_name = f"RTMP-{path.split('/')[-1]}"
+                                    
+                                    # Add the camera if it doesn't exist
+                                    if camera_name not in self.cameras:
+                                        log.info(f"Adding new RTMP stream: {camera_name} from {rtsp_url}")
+                                        self.add_camera(rtsp_url, camera_name)
+                                except Exception as e:
+                                    log.error(f"Error parsing RTMP publish message: {e}")
+                                    
+                            elif "closed: EOF" in line and "RTMP" in line:
+                                # RTMP connection closed, find and remove the corresponding camera
+                                try:
+                                    # Extract connection info from message
+                                    # Example: "[conn [::1]:63551] closed: EOF"
+                                    conn_info = line.split("[conn ")[1].split("]")[0]
+                                    
+                                    # Find cameras that were added from RTMP
+                                    rtmp_cameras = [name for name in self.cameras.keys() if name.startswith("RTMP-")]
+                                    
+                                    # If we have only one RTMP camera, remove it
+                                    # (This is a simplification - in a real app you'd want to track which connection
+                                    # corresponds to which camera)
+                                    if len(rtmp_cameras) == 1:
+                                        camera_name = rtmp_cameras[0]
+                                        log.info(f"Removing RTMP stream: {camera_name}")
+                                        if camera_name in self.cameras:
+                                            self.cameras[camera_name].cleanup()
+                                            del self.cameras[camera_name]
+                                except Exception as e:
+                                    log.error(f"Error handling RTMP close message: {e}")
+                                    
+                        elif self.rtmp_server_process.poll() is not None:
+                            break
+                    except Exception as e:
+                        log.error(f"Error reading RTMP server output: {e}")
+                        break
+            
+            threading.Thread(target=log_server_output, daemon=True).start()
+            
+            log.info("RTMP server started")
+        except Exception as e:
+            log.error(f"Failed to start RTMP server: {e}")
+            raise
+
+    def _monitor_rtmp_notifications(self):
+        """Monitor the notification pipe for new RTMP streams"""
+        try:
+            # Create named pipe if it doesn't exist
+            pipe_path = "/tmp/mediamtx_notify"
+            if not os.path.exists(pipe_path):
+                os.mkfifo(pipe_path)
+            
+            # Open pipe for reading
+            with open(pipe_path, 'r') as pipe:
+                while self.running:
+                    try:
+                        # Read notification
+                        line = pipe.readline().strip()
+                        if not line:
+                            continue
+                            
+                        # Parse notification
+                        if line.startswith("STREAM_READY:"):
+                            _, path, source_type, source_id = line.split(":")
+                            
+                            # Create RTSP URL for the stream
+                            rtsp_url = f"rtsp://localhost:8554/{path}"
+                            
+                            # Create a name for the camera based on the source
+                            camera_name = f"RTMP-{source_id}"
+                            
+                            # Add the camera if it doesn't exist
+                            if camera_name not in self.cameras:
+                                log.info(f"Adding new RTMP stream: {camera_name} from {rtsp_url}")
+                                self.add_camera(rtsp_url, camera_name)
+                    except Exception as e:
+                        log.error(f"Error processing RTMP notification: {e}")
+                        continue
+        except Exception as e:
+            log.error(f"Error in RTMP notification monitor: {e}")
+        finally:
+            # Clean up pipe
+            try:
+                os.unlink("/tmp/mediamtx_notify")
+            except:
+                pass
+
+    async def start(self) -> None:
+        """Start the stream processing with explicit memory management"""
+        log.info("Starting workshop stream")
+        self.running = True
+        
+        # Prevent sleep when starting
+        self._prevent_sleep()
+        
+        # Start RTMP server
+        self._start_rtmp_server()
+        
+        # Create tasks for input view
+        tasks = [
+            asyncio.create_task(self._capture_frames(camera))
+            for camera in self.cameras.values()
+        ]
+        
+        # Add debug viewer task if debug mode is enabled
+        if self.debug:
+            tasks.append(asyncio.create_task(self._run_debug_viewer()))
+        
+        try:
+            await asyncio.gather(*tasks)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            log.info("Shutting down...")
+            self.running = False
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            self.stop()
+
+    def stop(self) -> None:
+        """Stop the stream processing and clean up resources"""
+        self.running = False
+        
+        # Stop recording and streaming
+        if self.recording:
+            self.stop_recording()
+        if self.streaming:
+            self.stop_streaming()
+        
+        # Clean up cameras
+        for camera in self.cameras.values():
+            camera.cleanup()
+        
+        # Stop RTMP server
+        if self.rtmp_server_process:
+            try:
+                self.rtmp_server_process.terminate()
+                self.rtmp_server_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.rtmp_server_process.kill()
+            except Exception as e:
+                log.error(f"Error stopping RTMP server: {e}")
+        
+        # Restore sleep behavior
+        self._restore_sleep()
+        
+        # Clean up other resources
+        if self.debug:
+            cv2.destroyAllWindows()
+        
+        # Clear references to large objects
+        self.clean_frame_for_recording = None
+        self.output_frame = None
+        
+        # Run garbage collection
+        gc.collect()
+
     def add_camera(self, url: str, name: str) -> None:
         """Add a new camera to the stream"""
         camera = Camera(url=url, name=name)
@@ -2026,34 +2228,6 @@ class WorkshopStream:
             finally:
                 self._caffeinate_process = None
 
-    async def start(self) -> None:
-        """Start the stream processing with explicit memory management"""
-        log.info("Starting workshop stream")
-        self.running = True
-        
-        # Prevent sleep when starting
-        self._prevent_sleep()
-        
-        # Create tasks for input view
-        tasks = [
-            asyncio.create_task(self._capture_frames(camera))
-            for camera in self.cameras.values()
-        ]
-        
-        # Add debug viewer task if debug mode is enabled
-        if self.debug:
-            tasks.append(asyncio.create_task(self._run_debug_viewer()))
-        
-        try:
-            await asyncio.gather(*tasks)
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            log.info("Shutting down...")
-            self.running = False
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            self.stop()
-    
     async def _run_debug_viewer(self):
         """Run debug viewer with memory management"""
         try:
@@ -2303,40 +2477,12 @@ class WorkshopStream:
             if os.path.exists(output_mp4):
                 os.remove(output_mp4)  # Clean up failed output
 
-    def stop(self) -> None:
-        """Stop the stream processing and clean up resources"""
-        self.running = False
-        
-        # Stop recording and streaming
-        if self.recording:
-            self.stop_recording()
-        if self.streaming:
-            self.stop_streaming()
-        
-        # Clean up cameras
-        for camera in self.cameras.values():
-            camera.cleanup()
-        
-        # Restore sleep behavior
-        self._restore_sleep()
-        
-        # Clean up other resources
-        if self.debug:
-            cv2.destroyAllWindows()
-        
-        # Clear references to large objects
-        self.clean_frame_for_recording = None
-        self.output_frame = None
-        
-        # Run garbage collection
-        gc.collect()
-
 if __name__ == "__main__":
     # Quick test with debug viewer
     stream = WorkshopStream(debug=True)
-    stream.add_camera("rtsp://192.168.1.155:8554/live", "iphone 13")
+    # stream.add_camera("rtsp://192.168.1.155:8554/live", "iphone 13")
     stream.add_camera("rtsp://192.168.1.156:8554/live", "iphone xs")
-    stream.add_camera("rtsp://192.168.1.114:8080/h264_pcm.sdp", "galaxy s21")
+    # stream.add_camera("rtsp://192.168.1.114:8080/h264_pcm.sdp", "galaxy s21")
     
     print("Controls:")
     print("  1 - input view (all cameras)")
